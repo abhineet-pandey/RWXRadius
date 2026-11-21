@@ -188,14 +188,24 @@ def _child(job: dict, wfd: int):
                 else:
                     failed.add(nid)
 
+            def _why(self, test, err):
+                if os.environ.get("BR_DEBUG_FAIL"):
+                    import traceback
+
+                    out.setdefault("why", {})[str(self._nid(test))] = "".join(
+                        traceback.format_exception(*err))[-700:]
+
             def addError(self, test, err):
+                self._why(test, err)
                 self._fail(test)
 
             def addFailure(self, test, err):
+                self._why(test, err)
                 self._fail(test)
 
             def addSubTest(self, test, subtest, err):
                 if err is not None:
+                    self._why(test, err)
                     self._fail(test)
 
             def addUnexpectedSuccess(self, test):

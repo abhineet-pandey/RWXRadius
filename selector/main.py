@@ -23,20 +23,21 @@ REPO = os.environ.get("BR_REPO", "/opt/sqlglot")
 INDEX = os.environ.get("BR_INDEX", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "index.pkl.gz"))
 NO_REPLAY = os.environ.get("BR_NO_REPLAY") == "1"
 REPLAY_DATA_ONLY = os.environ.get("BR_REPLAY_DATA_ONLY") == "1"
+LABEL_OUT = os.environ.get("BR_LABEL_OUT")  # local-only: replay everything, dump failing sets
 
 # CPU model (server seconds). Replaying a test costs about its recorded time;
 # a commit's child costs a fixed amount plus per test-module import.
 CPU_RATIO = float(os.environ.get("BR_CPU_RATIO", "1.15"))
 CHILD_BASE_MS = int(os.environ.get("BR_CHILD_BASE_MS", "120"))
-MODULE_IMPORT_MS = {"tests/test_executor.py": 1500, "tests/test_optimizer.py": 120}
+MODULE_IMPORT_MS = {"tests/test_executor.py": 800, "tests/test_optimizer.py": 120}
 DEFAULT_MODULE_MS = 40
-CLASS_SETUP_MS = {"tests/test_executor.py::TestExecutor": 2500}
+CLASS_SETUP_MS = {"tests/test_executor.py::TestExecutor": 1200}  # measured: import+setUpClass ~1.75 s
 HEAVY_MODULES = ("tests/test_executor.py", "tests/test_optimizer.py")
 PER_COMMIT_WALL_S = 6.0  # 180 s / 30 commits (practice), 270 s / 45 (final)
 # once one replayed test fails the commit needs a worker anyway: stop if the
 # candidates left are cheap enough that dropping them saves little
 STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", "1500"))
-FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0}
+FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0, "tests/test_generator.py": 0.85}
 
 
 def log(*a):
@@ -238,7 +239,13 @@ def main():
         if not a.replayable or NO_REPLAY:
             forced |= cand
             cand = set()
-        rep, blind, base_cost, net = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num)
+        if LABEL_OUT and a.replayable:
+            # local labelling mode: replay every candidate, keep nothing blind
+            cand |= forced
+            forced = set()
+            rep, blind, base_cost, net = sorted(cand), [], 0, 1
+        else:
+            rep, blind, base_cost, net = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num)
         plans[cid] = {"replay": rep, "blind": blind, "an": a, "base": base_cost, "net": net,
                       "ncand": len(cand), "nforced": len(forced)}
         log(f"{cid}: cand={len(cand)} forced={len(forced)} base={base_cost/1000:.2f}s "
@@ -274,7 +281,7 @@ def main():
                 pl = plans[cid]
                 now = time.monotonic()
                 est = replay_cpu_ms(pl["replay"], tests_by_num, dur) / 1000.0
-                if now + est * 1.5 > budget_end:
+                if now + est * 1.5 > budget_end and not LABEL_OUT:
                     log(f"{cid}: skip replay (budget)")
                     results[cid] = {"error": "budget"}
                     continue
@@ -287,7 +294,7 @@ def main():
                 deadline = now + 30 + est * 6
                 try:
                     rp.start(cid, a.overlay, [m for m in a.probe_modules if m], job_tests, deadline,
-                             stop_after_fail_ms=STOP_AFTER_FAIL_MS)
+                             stop_after_fail_ms=0 if LABEL_OUT else STOP_AFTER_FAIL_MS)
                 except Exception as e:  # noqa
                     log(f"{cid}: replay start failed {e}")
                     results[cid] = {"error": str(e)}
@@ -300,6 +307,7 @@ def main():
     id_to_num = {t["id"]: t["number"] for t in tests}
     total = 0
     out_lines = []
+    labels = {}
     for cid in sorted(plans):
         pl = plans[cid]
         sel = set(pl["blind"])
@@ -335,10 +343,14 @@ def main():
                     sel |= set(rep) - ran
                     log(f"{cid}: replayed {len(rep)} in {r.get('cpu')}s cpu -> {len(failed)} failing {r.get('t')}")
         sel = sorted(sel)
+        if LABEL_OUT:
+            labels[cid] = {"failing": sel, "kind": "replay" if rep else "blind"}
         workers = optimize(sel, dur, swap_trials=256) if sel else []
         c = cost_ms(workers, dur)
         total += c
         out_lines.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+    if LABEL_OUT:
+        json.dump({"commits": labels}, open(LABEL_OUT, "w"))
     log(f"done in {time.monotonic() - t0:.2f}s; simulated cost {total/1000:.1f}s")
     return out_lines
 

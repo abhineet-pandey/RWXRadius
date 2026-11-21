@@ -228,8 +228,18 @@ class PyAnalyzer:
     def handle(self, site: astdiff.Site):
         path = site.path
         if site.node is not None and self.is_docstring(site):
-            # only __doc__ changes: readers of docstrings
-            self.add(self.idx.names_of_all({"__doc__", "getdoc", "doc"}), "docstring")
+            # Only __doc__ changes. At the pinned commit the sole reader of
+            # __doc__ is Expr.__init_subclass__ (expressions/core.py), which
+            # writes the value straight back (`or ""`); it is executed at import
+            # by every test, so the name index would select the whole suite.
+            # Readers of other `__doc__` sites, getdoc() and `doc` still count.
+            # Text readers of the file are covered by the file-open map, and the
+            # import probe still guards against the module failing to import.
+            readers = self.idx.names_of_all({"getdoc", "doc"})
+            if self.idx.imp_name_sites.get("__doc__", ()) != [("sqlglot/expressions/core.py", 112, "?", True)]:
+                readers |= self.idx.names_of("__doc__")
+            self.an.needs_probe = True
+            self.add(readers, "docstring")
             return
         nodes = path + ([site.node] if site.node is not None else [])
         # innermost runtime scope (function / lambda body) containing the site
