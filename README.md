@@ -62,6 +62,28 @@ baseline tree and classified:
 * pytest configuration changes, binary patches and anything unparseable fall
   back to all tests.
 
+### 2b. Dict-entry narrowing by state diff (`selector/statefp.py`)
+
+Most definition-time edits change one entry of a class-level dict
+(`TRANSFORMS`, `FUNCTIONS`, `KEYWORDS`, `SHOW_PARSERS`, ...). Statically, every
+user of the class looks affected. Two baseline maps make this precise:
+
+| Map | What it records |
+| --- | --- |
+| `maps/keys.pkl.gz` (offline, `tools/keyprobe.py`) | after importing all of sqlglot, every plain dict held by a class attribute or module global is swapped for a recording copy; per test, which keys it reads (`*` whole-dict reads, `#` size checks). The generator's dispatch cache records each lookup as a read of that key of the `TRANSFORMS` it was built from. Dicts still referenced from elsewhere after the swap are marked leaky and never narrowed |
+| `maps/state.pkl` (built in the image, `selector/statebuild.py`) | fingerprint of every class attribute and module global of the pinned checkout, per entry for dicts; line numbers ignored. Labels whose fingerprint depends on hash seed or heap layout are recorded as noisy |
+
+When a commit's keyed candidates are expensive, its replay child first imports
+every sqlglot module from the patched overlay and fingerprints it. The diff
+against the baseline lists exactly which dict entries changed, including
+state derived from them while importing (merged dicts, tries, metaclass
+registries). If every change is a tracked dict entry (or a data attribute of a
+class, handled by the static class-user ∩ name-reader rule), the keyed
+candidates shrink to the tests that read those entries, intersected with the
+static candidates; anything else (code, untracked or leaky containers, a
+module that fails to import) keeps the static plan. The child then plans and
+runs the replay of the narrowed set.
+
 ### 3. Replay (`selector/replay.py`)
 
 Candidates are confirmed by actually running them. The main process preloads

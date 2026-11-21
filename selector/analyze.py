@@ -107,6 +107,14 @@ class Analysis:
     notes: list = field(default_factory=list)
     code_changed: bool = False  # some Python change with semantic effect
     needs_probe: bool = False  # a change that runs at import time could break importing
+    # Candidates from definition-time assignments (class attributes, module
+    # globals). Their effect is entirely in import-time state, so a run-time
+    # diff of that state can replace them with the readers of the changed
+    # dict entries. `other` holds every candidate from anything else.
+    keyed: int = 0
+    other: int = 0
+    keyed_modules: set = field(default_factory=set)
+    keyed_labels: set = field(default_factory=set)  # state labels assigned; None = unknown
 
 
 def _op_result(op, sig):
@@ -211,9 +219,16 @@ class PyAnalyzer:
         self.is_test = rel.startswith("tests/")
 
     # -- helpers
+    keyed_mode = False
+
     def add(self, bits, why):
         if bits:
             self.an.cand |= bits
+            if self.keyed_mode:
+                self.an.keyed |= bits
+                self.an.keyed_modules.add(self.mod)
+            else:
+                self.an.other |= bits
         self.an.notes.append(f"{self.rel}: {why} -> {bin(bits).count('1')}")
 
     def module_scope(self) -> int:
@@ -368,7 +383,7 @@ class PyAnalyzer:
             names = set()
             for nn in site.new_nodes:
                 names |= _targets(nn)
-            self.def_names(chain, names, None, site.new_nodes)
+            self.keyed_def_names(chain, names, None, site.new_nodes)
             return
         # Innermost module/class body statement on the path.
         top = None
@@ -425,7 +440,23 @@ class PyAnalyzer:
         new_names = set()
         for nn in site.new_nodes or ():
             new_names |= _targets(nn)
-        self.def_names(chain, _targets(top) | new_names, top, [])
+        self.keyed_def_names(chain, _targets(top) | new_names, top, [])
+
+    def keyed_def_names(self, chain, names, top, new_nodes):
+        self.keyed_mode = not self.is_test
+        assign = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+        nodes = [top] if top is not None else list(new_nodes)
+        if self.keyed_mode:
+            if names and nodes and all(isinstance(n, assign) for n in nodes):
+                q = ".".join(c.name for c in chain)
+                for nm in names:
+                    self.an.keyed_labels.add(f"{self.mod}:{q}.{nm}" if q else f"{self.mod}:{nm}")
+            else:
+                self.an.keyed_labels.add(None)
+        try:
+            self.def_names(chain, names, top, new_nodes)
+        finally:
+            self.keyed_mode = False
 
     def method_replaced(self, chain, top, new_nodes):
         """An undecorated method replaced by undecorated method(s), e.g. renamed.
@@ -574,6 +605,7 @@ def analyze(patch_text: str, idx: Index, repo_root: str) -> Analysis:
         try:
             _analyze_file(fp, idx, repo_root, an)
         except Exception as e:  # noqa
+            an.other |= idx.ALL
             an.cand |= idx.ALL
             an.notes.append(f"{fp.path}: analysis error {type(e).__name__}: {e}")
     return an
@@ -604,6 +636,7 @@ def _analyze_file(fp: patchparse.FilePatch, idx: Index, root: str, an: Analysis)
     old_text = _read(root, old_rel) if old_rel else None
     if old_rel and old_text is None:
         # patch against a file we do not have
+        an.other |= idx.ALL
         an.cand |= idx.ALL
         an.notes.append(f"missing baseline {old_rel}")
         an.replayable = False
@@ -624,8 +657,10 @@ def _analyze_file(fp: patchparse.FilePatch, idx: Index, root: str, an: Analysis)
 
     # Files read as data (fixtures, sources read as text) and directory scans
     for rel in rels:
+        an.other |= idx.opens_of(rel)
         an.cand |= idx.opens_of(rel)
         if fp.is_new or fp.is_deleted or fp.rename:
+            an.other |= _listers(idx, rel)
             an.cand |= _listers(idx, rel)
 
     py = [r for r in rels if r.endswith(".py") and (r.startswith("sqlglot/") or r.startswith("tests/"))]
@@ -638,9 +673,15 @@ def _analyze_file(fp: patchparse.FilePatch, idx: Index, root: str, an: Analysis)
     fail_bits = 0
     for r in rels:
         fail_bits |= idx.importers(r)
-        if r in idx.core or (r.startswith("sqlglot/") and r.endswith("__init__.py")):
-            fail_bits |= idx.ALL if r in idx.core else 0
+        if r.startswith("sqlglot/"):
+            # sqlglot imports dialects, parsers, generators and optimizer rules
+            # lazily, by name: the baseline map only credits the import to the
+            # first test of a worker that triggered it, so "importers" misses
+            # tests (verified on syntax-error mutants). A sqlglot module that
+            # stops importing can fail any test.
+            fail_bits |= idx.ALL
     if fp.is_deleted or fp.rename:
+        an.other |= fail_bits
         an.cand |= fail_bits
         an.notes.append(f"deleted/renamed module {rel}")
         if fp.rename and fp.new_path:
@@ -660,6 +701,7 @@ def _analyze_file(fp: patchparse.FilePatch, idx: Index, root: str, an: Analysis)
     try:
         old_tree = ast.parse(old_text.encode("utf-8", "surrogateescape"))
     except SyntaxError:
+        an.other |= idx.ALL
         an.cand |= idx.ALL
         return
     try:

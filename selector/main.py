@@ -48,6 +48,79 @@ STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", str(10 ** 9)))
 # candidates break something).
 P_PASS = float(os.environ.get("BR_P_PASS", "0.5"))
 FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0, "tests/test_generator.py": 0.85}
+# State diff (see statefp): importing every sqlglot module from the overlay
+# and fingerprinting it costs about this much CPU on top of a replay child.
+SD_CPU_MS = int(os.environ.get("BR_SD_CPU_MS", "700"))
+NO_SD = os.environ.get("BR_NO_SD") == "1"
+SD_MIN_GAIN_MS = int(os.environ.get("BR_SD_MIN_GAIN_MS", "600"))
+MAPS = os.path.dirname(INDEX)
+KEYS = os.environ.get("BR_KEYS", os.path.join(MAPS, "keys.pkl.gz"))
+STATE = os.environ.get("BR_STATE", os.path.join(MAPS, "state.pkl"))
+MODULES = os.environ.get("BR_MODULES", os.path.join(MAPS, "modules.json"))
+IMPORT_ALL_MS = 300
+
+
+class KeyMap:
+    """Baseline dict-entry readers (maps/keys.pkl.gz) and import-time state
+    fingerprints (maps/state.pkl, built in the image). Loaded on first use."""
+
+    def __init__(self, idx_tests):
+        import gzip
+        import pickle
+
+        with open(KEYS, "rb") as fh:
+            d = pickle.loads(gzip.decompress(fh.read()))
+        if d["tests"] != idx_tests:
+            raise ValueError("key map built for other tests")
+        self.__dict__.update(d)
+        self.leaky = set(self.leaky)
+        with open(STATE, "rb") as fh:
+            st = pickle.load(fh)
+        self.mods = st["mods"]
+        self.mod_set = set(self.mods)
+        self.state = st["state"]
+        self.noisy = st["noisy"]
+        self.noisy_keys = st["noisy_keys"]
+
+    def readers(self, res, changed_mods, idx=None):
+        """Tests that read a changed entry, or None when the diff is not
+        fully explained. Changed dict entries: their recorded readers. Other
+        changed data attributes of classes: tests using the class that execute
+        a line naming the attribute (the static rule for class constants)."""
+        if res is None:
+            return None, "no diff"
+        keyed, other = res
+        other = [x for x in other if not (x[0] in self.noisy and x[0].split(":")[0] not in changed_mods)]
+        extra = 0
+        for lab, bk, nk in other:
+            mod, _, q = lab.partition(":")
+            cls, _, attr = q.rpartition(".")
+            if (idx is None or not cls or bk not in ("V", None) or nk not in ("V", None)
+                    or not idx.users.get(f"{mod}.{cls}")):
+                return None, f"other state changed: {[x[0] for x in other][:4]}"
+            rd = idx.names_of(attr)
+            if not attr.isupper():
+                rd |= idx.names_of("<dynamic>")
+            extra |= (idx.users_of(f"{mod}.{cls}") & rd) | idx.names_of(f"{cls.rsplit('.', 1)[-1]}.{attr}")
+        acc = self.sets[self.unknown]
+        sets = self.sets
+        acc_idx = extra
+        for lab, (keys, keyset) in keyed.items():
+            canon = self.aliases.get(lab)
+            if canon is None or canon in self.leaky:
+                return None, f"untracked {lab}"
+            nk = self.noisy_keys.get(lab)
+            if nk and lab.split(":")[0] not in changed_mods:
+                keys = keys - nk
+            e = self.km.get(canon, {})
+            for k in keys:
+                if k in e:
+                    acc |= sets[e[k]]
+            for k in ("*", "?") + (("#",) if keyset else ()):
+                if k in e:
+                    acc |= sets[e[k]]
+        return (acc, acc_idx), (f"{sum(len(k) for k, _ in keyed.values())} entries of {len(keyed)} dicts"
+                                + (f", {len(other)} attrs" if other else ""))
 
 
 def log(*a):
@@ -71,10 +144,10 @@ def bits_iter(b: int):
     return [i for i, c in enumerate(s) if c == "1"]
 
 
-def replay_cpu_ms(nums, tests_by_num, dur) -> int:
+def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS) -> int:
     files = set()
     classes = set()
-    total = CHILD_BASE_MS
+    total = base_ms
     for n in nums:
         t = tests_by_num[n]
         files.add(t["file"])
@@ -99,7 +172,7 @@ def lb_cost(total: int, longest: int, count: int) -> int:
     return min(max(longest, -(-total // k)) + 2000 * k for k in range(1, min(8, count) + 1))
 
 
-def plan_replay(cand: list, forced: list, dur, tests_by_num):
+def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHILD_BASE_MS):
     """Split candidates into (replay, blind). Replay the cheapest prefix of the
     candidates (by duration) maximising (cost of selecting everything) -
     (cost of the rest) - (replay CPU). Uses the packing lower bound while
@@ -116,7 +189,7 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num):
     for i in range(len(order) - 1, -1, -1):
         suffix_total[i] = suffix_total[i + 1] + dur[order[i]]
     files, classes = set(), set()
-    cpu = CHILD_BASE_MS
+    cpu = base_ms
     best_net, best_i = 0, 0
     for i, n in enumerate(order):
         t = tests_by_num[n]
@@ -139,7 +212,7 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num):
         return [], allsel, base_cost, 0
     rep = order[:best_i]
     blind = sorted(forced_set | set(order[best_i:]))
-    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur)
+    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur, base_ms)
     if net <= 0:
         return [], allsel, base_cost, 0
     # tests that fit into the blind schedule's slack are free: no replay needed
@@ -150,6 +223,31 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num):
             rep = [n for n in rep if n not in free]
             blind = sorted(set(blind) | free)
     return rep, blind, base_cost, net
+
+
+def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_nums):
+    """Planner run inside the replay child once the state diff is known.
+    Falls back to the commit's static plan when the diff is not explained."""
+    rest, forced = pl["sd"]["rest"], pl["forced"]
+    static_keyed = set(to_nums(pl["an"].keyed)) | set(pl["sd"]["unknown"])
+
+    def job(nums):
+        return [(tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n])
+                for n in sorted(nums, key=lambda n: (dur[n], n))]
+
+    def plan(res):
+        bits, note = km.readers(res, changed_mods, idx)
+        if bits is None:
+            return job(pl["replay"]), list(pl["replay"]), list(pl["blind"]), "fallback: " + note
+        kbits, ibits = bits
+        # both the diff's readers and the static keyed candidates are supersets
+        narrowed = (set(km_nums(kbits)) | set(to_nums(ibits))) & static_keyed
+        cand = (rest | narrowed) - forced
+        # the child already paid for its start and sqlglot import
+        rep, blind, _, _ = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num, base_ms=0)
+        return job(rep), list(rep), list(blind), f"{note} -> {len(cand)} cand"
+
+    return plan
 
 
 def write_out(out_fd: int, lines: list):
@@ -257,18 +355,57 @@ def main():
         else:
             rep, blind, base_cost, net = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num)
         plans[cid] = {"replay": rep, "blind": blind, "an": a, "base": base_cost, "net": net,
-                      "ncand": len(cand), "nforced": len(forced)}
+                      "ncand": len(cand), "nforced": len(forced), "cand": cand, "forced": forced}
+        if a.keyed and a.replayable and a.code_changed and not NO_SD and not LABEL_OUT:
+            # what the keyed part costs at most: the plan without it
+            rest = (set(to_nums(a.other)) | (set(unknown) if a.other else set())) - forced
+            r_rep, r_blind, _, r_net = plan_replay(sorted(rest), sorted(forced), dur, tests_by_num)
+            # expected cost of the static plan if its replays pass, against the
+            # best case of the diff (keyed candidates all dropped) plus its CPU
+            static = sched_cost(blind, dur) + (replay_cpu_ms(rep, tests_by_num, dur) if rep else 0)
+            narrow = sched_cost(r_blind, dur) + replay_cpu_ms(r_rep, tests_by_num, dur) + SD_CPU_MS
+            gain = static - narrow
+            if gain > SD_MIN_GAIN_MS:
+                plans[cid]["sd"] = {"rest": rest, "gain": gain, "unknown": unknown}
         log(f"{cid}: cand={len(cand)} forced={len(forced)} base={base_cost/1000:.2f}s "
-            f"replay={len(rep)} blind={len(blind)} est_net={net/1000:.2f}s | " + "; ".join(a.notes)[:600])
+            f"replay={len(rep)} blind={len(blind)} est_net={net/1000:.2f}s"
+            + (f" sd_gain={plans[cid]['sd']['gain']/1000:.2f}s" if "sd" in plans[cid] else "")
+            + " | " + "; ".join(a.notes)[:600])
     log(f"analysis done at {time.monotonic() - t0:.2f}s")
 
+    # ---- state diffs: keyed candidates narrowed in the replay child
+    km = None
+    if any("sd" in pl for pl in plans.values()):
+        try:
+            km = KeyMap(idx.tests)
+        except Exception as e:  # noqa
+            log("key map unavailable:", e)
+    for cid, pl in plans.items():
+        if "sd" not in pl:
+            continue
+        a = pl["an"]
+        changed_mods = {an_mod.module_name(r) for r in a.overlay if r.endswith(".py")}
+        if km is None or not a.keyed_modules <= km.mod_set or not (changed_mods - {None}) <= km.mod_set:
+            del pl["sd"]
+            continue
+        # the assigned names must be tracked dicts, or the diff cannot be explained
+        untracked = [x for x in a.keyed_labels if x is None or x not in km.aliases or km.aliases[x] in km.leaky]
+        if untracked:
+            log(f"{cid}: no state diff, untracked {untracked[:3]}")
+            del pl["sd"]
+            continue
+        pl["sd"]["plan"] = make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, to_nums)
+        pl["net"] = max(pl["net"], pl["sd"]["gain"])
+        pl["sd_tag"] = True
+
     # ---- replay
-    to_run = [cid for cid in sorted(plans) if plans[cid]["replay"]]
+    to_run = [cid for cid in sorted(plans) if plans[cid]["replay"] or "sd" in plans[cid]]
     # Commits not replayed whose change runs at import time: a child that only
     # imports the changed modules, so an import-time failure is not missed.
     probe_only = [
         cid for cid in sorted(plans)
-        if not plans[cid]["replay"] and plans[cid]["an"] is not None and plans[cid]["an"].needs_probe
+        if not plans[cid]["replay"] and "sd" not in plans[cid]
+        and plans[cid]["an"] is not None and plans[cid]["an"].needs_probe
         and plans[cid]["an"].replayable and any(plans[cid]["an"].probe_modules)
     ]
     to_run += probe_only
@@ -278,6 +415,12 @@ def main():
         from .replay import Replayer
 
         rp = Replayer(REPO, parallel=2)
+        base_mods = None
+        try:
+            with open(MODULES) as fh:
+                base_mods = json.load(fh)
+        except Exception as e:  # noqa
+            log("module list unavailable:", e)
         heavy = any(
             any(tests_by_num[n]["file"] in HEAVY_MODULES for n in plans[c]["replay"]) for c in to_run
         )
@@ -291,6 +434,10 @@ def main():
                 pl = plans[cid]
                 now = time.monotonic()
                 est = replay_cpu_ms(pl["replay"], tests_by_num, dur) / 1000.0
+                if "sd" in pl:
+                    est += SD_CPU_MS / 1000.0
+                elif pl["an"].needs_probe:
+                    est += IMPORT_ALL_MS / 1000.0
                 if now + est * 1.5 > budget_end and not LABEL_OUT:
                     log(f"{cid}: skip replay (budget)")
                     results[cid] = {"error": "budget"}
@@ -304,7 +451,10 @@ def main():
                 deadline = now + 30 + est * 6
                 try:
                     rp.start(cid, a.overlay, [m for m in a.probe_modules if m], job_tests, deadline,
-                             stop_after_fail_ms=0 if LABEL_OUT else STOP_AFTER_FAIL_MS)
+                             stop_after_fail_ms=0 if LABEL_OUT else STOP_AFTER_FAIL_MS,
+                             sd=({"mods": km.mods, "state": km.state, "plan": pl["sd"]["plan"]}
+                                 if "sd" in pl else None),
+                             import_all=base_mods if a.needs_probe else None)
                 except Exception as e:  # noqa
                     log(f"{cid}: replay start failed {e}")
                     results[cid] = {"error": str(e)}
@@ -330,8 +480,13 @@ def main():
                 for m in a.probe_modules:
                     fb = a.on_import_fail.get(m)
                     sel |= set(to_nums(idx.ALL if fb is None else fb))
-        elif rep:
+        elif rep or "sd" in pl:
             r = results.get(cid)
+            if r is not None and "error" not in r and "sd" in r:
+                # the child planned from the state diff
+                log(f"{cid}: state diff: {r['sd']['note']}")
+                sel = set(r["sd"]["blind"])
+                rep = r["sd"]["rep"]
             if r is None or "error" in r:
                 sel |= set(rep)
                 if r is not None:
@@ -352,6 +507,14 @@ def main():
                     ran = {id_to_num[x] for x in r["fail"] + r["pass"] if x in id_to_num}
                     sel |= set(rep) - ran
                     log(f"{cid}: replayed {len(rep)} in {r.get('cpu')}s cpu -> {len(failed)} failing {r.get('t')}")
+        r = results.get(cid)
+        if r is not None and r.get("import_fail"):
+            # modules that imported at the baseline and no longer do: every
+            # test importing them (or running their code) fails
+            log(f"{cid}: modules fail to import {r['import_fail'][:5]}")
+            # sqlglot modules are imported lazily by name, so their importers
+            # are not fully mapped: any test can fail (see analyze.fail_bits)
+            sel |= set(to_nums(idx.ALL))
         sel = sorted(sel)
         if LABEL_OUT:
             labels[cid] = {"failing": sel, "kind": "replay" if rep else "blind"}

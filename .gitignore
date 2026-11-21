@@ -19,6 +19,7 @@ output*
 # Raw tracing output; only maps/index.pkl.gz is committed
 maps/*
 !maps/index.pkl.gz
+!maps/keys.pkl.gz
 map_*/
 iso_*/
 cmp_*/

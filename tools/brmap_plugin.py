@@ -24,6 +24,7 @@ ROOT = os.path.realpath(os.environ.get("BRMAP_ROOT", os.getcwd())) + os.sep
 OUT = os.environ.get("BRMAP_OUT")
 RECV = os.environ.get("BRMAP_RECV", "1") == "1"
 CMP = os.environ.get("BRMAP_CMP") == "1"  # comparison value profiles instead of tracing
+KEYS = os.environ.get("BRMAP_KEYS") == "1"  # dict-key read map instead of tracing
 
 mon = sys.monitoring
 TOOL = 3  # free tool id (0..5); 1 is coverage, 2 profiler, 5 optimizer
@@ -102,7 +103,7 @@ def _start_cb(code, offset):
 
 
 def _audit(event, args):
-    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec", "os.system"):
+    if event in ("subprocess.Popen", "os.posix_spawn", "os.exec", "os.system", "os.fork", "os.forkpty"):
         if _state["ctx"] is not None:
             _bucket("opens").add(("subprocess", "*"))
         return
@@ -187,6 +188,13 @@ def pytest_configure(config):
 
         cmpprobe.install(ROOT)
         return
+    if KEYS:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import keyprobe
+
+        keyprobe.install(_state)
+        sys.addaudithook(_audit)
+        return
     mon.use_tool_id(TOOL, "brmap")
     mon.register_callback(TOOL, mon.events.LINE, _line_cb)
     ev = mon.events.LINE
@@ -203,6 +211,8 @@ def pytest_runtest_protocol(item, nextitem):
         yield
         return
     _state["ctx"] = item.nodeid
+    if KEYS:
+        _bucket("opens")
     _state["phase"] = "call"
     mon.restart_events()
     try:
@@ -246,6 +256,11 @@ def pytest_sessionfinish(session):
         return
     os.makedirs(OUT, exist_ok=True)
     wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    if KEYS:
+        import keyprobe
+
+        keyprobe.dump(os.path.join(OUT, f"keys_{wid}.pkl"), DATA, OUTCOMES)
+        return
     if CMP:
         import cmpprobe
 

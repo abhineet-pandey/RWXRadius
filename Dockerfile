@@ -19,6 +19,12 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests /app/selecto
 # Sanity check at build time: the baseline index matches this checkout.
 RUN cd /app && python -m selector.verify /opt/sqlglot
 
+# Fingerprints of the pinned checkout's import-time state (class attributes,
+# module globals), taken with this image's Python so they compare exactly with
+# the patched state the selector fingerprints at run time.
+RUN cd /app && python -m selector.statebuild /opt/sqlglot /app/maps/state.pkl \
+    && chmod a+r /app/maps/state.pkl /app/maps/modules.json
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     BR_REPO=/opt/sqlglot \

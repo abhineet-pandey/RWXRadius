@@ -165,6 +165,49 @@ def _child(job: dict, wfd: int):
                 finally:
                     signal.setitimer(signal.ITIMER_REAL, 0)
 
+        def import_everything():
+            # A definition-time change can break importing *other* modules
+            # (one that builds objects from the changed class while importing).
+            # Every module that imports at the baseline must still import.
+            mods = job.get("import_all") or []
+            if not mods:
+                return
+            from . import statefp
+
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 60)
+                ok = set(statefp.import_all(only=[m for m in mods if m not in sys.modules]))
+            except BaseException:  # noqa
+                ok = set()
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            bad = [m for m in mods if m not in sys.modules and m not in ok]
+            if bad:
+                out["import_fail"] = bad
+
+        sd = job.get("sd")
+        if sd is not None:
+            # Which import-time state did the patch change? Import every
+            # module the baseline snapshot covers from the overlay, fingerprint
+            # it and let the parent's planner pick the tests from the diff.
+            res = None
+            try:
+                from . import statefp
+
+                signal.setitimer(signal.ITIMER_REAL, 60)
+                ok = statefp.import_all(only=sd["mods"])
+                if len(ok) == len(sd["mods"]):
+                    res = statefp.diff(sd["state"], statefp.snapshot(ok))
+                else:
+                    out["import_fail"] = sorted(set(sd["mods"]) - set(ok))
+            except BaseException:  # noqa
+                res = None
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            tests, rep, blind, note = sd["plan"](res)
+            job["tests"] = tests
+            out["sd"] = {"rep": rep, "blind": blind, "note": note}
+
         # group: file -> class -> [(nodeid, method, timeout)]
         groups: dict = {}
         for item in job["tests"]:
@@ -287,6 +330,7 @@ def _child(job: dict, wfd: int):
                     signal.setitimer(signal.ITIMER_REAL, 0)
             out["t"][f] = round(time.process_time() - tf, 3)
         probe_imports()
+        import_everything()
         for item in job["tests"]:
             nid = item[0]
             if nid in failed or nid not in passed:
@@ -321,11 +365,13 @@ class Replayer:
                 except Exception as e:  # noqa
                     log("preload failed", m, e)
 
-    def start(self, key: str, overlay: dict, probe: list, tests: list, deadline: float, stop_after_fail_ms: int = 0):
+    def start(self, key: str, overlay: dict, probe: list, tests: list, deadline: float, stop_after_fail_ms: int = 0,
+              sd: dict | None = None, import_all: list | None = None):
         dest = os.path.join(TMP, key)
         shutil.rmtree(dest, ignore_errors=True)
         build_overlay(self.repo, overlay, dest)
-        job = {"overlay": dest, "probe": probe, "tests": tests, "stop_after_fail_ms": stop_after_fail_ms}
+        job = {"overlay": dest, "probe": probe, "tests": tests, "stop_after_fail_ms": stop_after_fail_ms,
+               "sd": sd, "import_all": import_all}
         if _uses_duckdb(dest, {str(t[0]).split("::")[0] for t in tests}):
             # duckdb reserves several GB of address space when it connects: an
             # address-space cap kills the child (measured: 3 GB dies, 4 GB ok),
@@ -333,6 +379,8 @@ class Replayer:
             # still bounds a runaway mutant; the kernel then kills this child,
             # whose candidates are all kept.
             job["mem_headroom"] = 16384 << 20
+        if sd is not None:
+            job["mem_headroom"] = 16384 << 20  # the child picks its tests later
         if os.environ.get("BR_MEM_HEADROOM_MB"):
             job["mem_headroom"] = int(os.environ["BR_MEM_HEADROOM_MB"]) << 20
         r, w = os.pipe()
