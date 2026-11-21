@@ -125,6 +125,31 @@ def _span(node) -> range:
     return range(node.lineno, (node.end_lineno or node.lineno) + 1)
 
 
+def _body_lines(fn) -> range:
+    """Lines a call of `fn` executes. The `def` line, decorators and default
+    values run when the definition executes (import time for module and class
+    level functions), so every importer covers them; any call runs at least
+    one instruction of the body. Falls back to the whole definition when the
+    body shares the `def` line or has no statement that surely gets a line."""
+    body = getattr(fn, "body", None) or []
+    real = [
+        s for s in body
+        if not isinstance(s, ast.Pass) and not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+    ]
+    if not real:
+        return _span(fn)
+    # last line of the signature (defaults / annotations can span lines)
+    sig_end = fn.lineno
+    for n in ast.walk(fn.args):
+        sig_end = max(sig_end, getattr(n, "end_lineno", None) or 0)
+    if fn.returns is not None:
+        sig_end = max(sig_end, fn.returns.end_lineno or 0)
+    start = real[0].lineno
+    if start <= sig_end:
+        return _span(fn)
+    return range(start, (fn.end_lineno or start) + 1)
+
+
 def _header_span(stmt) -> range:
     """Lines of a compound statement's header (before its first body stmt)."""
     first_body = None
@@ -359,8 +384,19 @@ class PyAnalyzer:
             return
         whole = k_top == len(nodes) - 1 and site.node is top
         if isinstance(top, FUNC) and not whole:
-            # decorators / defaults / signature of a def: affects its callers
-            self.add(self.idx.lines_tests(self.rel, _span(top)), f"def header {top.name}")
+            # decorators / defaults / signature of a def: affects its callers.
+            # Every call that completed at the baseline ran the body; the def
+            # line and default values themselves run at import for everyone.
+            body = self.idx.lines_tests(self.rel, _body_lines(top))
+            child = nodes[k_top + 1] if k_top + 1 < len(nodes) else None
+            fld = _child_field(top, child) if child is not None else None
+            if fld in ("args", "returns") and not top.decorator_list:
+                # Parameters / defaults / annotations of an undecorated def:
+                # only calls observe them (parameter-name introspection in the
+                # pinned sources is limited to calls that follow it).
+                self.add(body, f"def signature {top.name} (callers)")
+                return
+            self.add(body, f"def header {top.name}")
             if chain:
                 self.add(self.idx.users_of(self.class_key(chain)) & self.idx.names_of(top.name),
                          f"method {top.name} readers")
@@ -374,7 +410,56 @@ class PyAnalyzer:
             if not self.idx.users.get(key):
                 self.add(self.module_scope(), "class unseen -> module scope")
             return
-        self.def_names(chain, _targets(top), top, [])
+        if (
+            whole
+            and isinstance(top, FUNC)
+            and chain
+            and not self.is_test
+            and not top.decorator_list
+            and site.new_nodes
+            and all(isinstance(n, FUNC) and not n.decorator_list for n in site.new_nodes)
+            and self.idx.users.get(self.class_key(chain))
+        ):
+            self.method_replaced(chain, top, site.new_nodes)
+            return
+        new_names = set()
+        for nn in site.new_nodes or ():
+            new_names |= _targets(nn)
+        self.def_names(chain, _targets(top) | new_names, top, [])
+
+    def method_replaced(self, chain, top, new_nodes):
+        """An undecorated method replaced by undecorated method(s), e.g. renamed.
+        Calls that resolved to the old method ran its body. Names the class no
+        longer defines resolve elsewhere only for those callers (attribute
+        dispatch in the pinned sources always calls what it finds). Names it
+        newly defines can capture lookups that never reached the old body
+        (`dir()`-based dispatch), so they keep the class-user/reader scope."""
+        key = self.class_key(chain)
+        kname = chain[-1].name
+        excl = set(_span(top))
+        self.add(self.idx.lines_tests(self.rel, _body_lines(top)), f"method {top.name} replaced (callers)")
+        old = {top.name}
+        new = set()
+        for n in new_nodes:
+            new |= _targets(n)
+        # a new name may also shadow/override an existing definition in the
+        # class: every name other than the old one counts as added
+        added = new - old
+        removed = old - new
+        users = self.idx.users_of(key)
+        if added:
+            readers = self.idx.names_of_all(added)
+            # class-level dir() scans in the pinned sources (generator and
+            # simplify dispatch tables) only pick public `*_sql` names; other
+            # dynamic reads target module members and instance dicts
+            if any(a.endswith("_sql") and not a.startswith("_") for a in added):
+                readers |= self.idx.names_of("<dynamic>")
+            self.add(users & readers | self.idx.names_of_all({f"{kname}.{a}" for a in added}),
+                     f"method names added {sorted(added)[:3]}")
+        if removed or added:
+            self.add(self.consumers(removed | added, excl, kname, key), "method import-time consumers")
+        if removed:
+            self.add(self.idx.names_of_all({f"{kname}.{a}" for a in removed}), "qualified readers of removed")
 
     def def_names(self, chain, names, top, new_nodes):
         excl = set(_span(top)) if top is not None else set()
@@ -383,7 +468,7 @@ class PyAnalyzer:
             self.add(bits, f"test deftime {sorted(names)[:3]}")
             return
         if top is not None and isinstance(top, FUNC):
-            self.add(self.idx.lines_tests(self.rel, _span(top)), f"def {top.name} replaced")
+            self.add(self.idx.lines_tests(self.rel, _body_lines(top)), f"def {top.name} replaced")
         if top is not None and isinstance(top, ast.ClassDef):
             key = self.class_key(chain + [top])
             self.add(self.idx.users_of(key), f"class {top.name} replaced")
@@ -398,7 +483,7 @@ class PyAnalyzer:
             assign = (ast.Assign, ast.AnnAssign, ast.AugAssign)
             assign_only = isinstance(top, assign) if top is not None else bool(new_nodes) and all(
                 isinstance(n, assign) for n in new_nodes)
-            if names and assign_only and not self.import_time_loads(names, excl):
+            if names and assign_only and not self.import_time_loads(names, excl, key):
                 # Nothing derives from the attribute at import time: only tests
                 # using the class that read it by name can see it. Dynamic
                 # attribute reads in the pinned sources (getattr with computed
@@ -413,7 +498,7 @@ class PyAnalyzer:
             else:
                 self.add(users | qualified, f"class attr {kname}.{sorted(names)[:3]}")
                 # other definitions copying it by class name at import time
-                self.add(self.consumers(names, excl, kname), "attr import-time consumers")
+                self.add(self.consumers(names, excl, kname, key), "attr import-time consumers")
             if not names:
                 self.add(self.module_scope(), "class stmt w/o names")
         else:
@@ -425,21 +510,42 @@ class PyAnalyzer:
             if top is not None and isinstance(top, (ast.Import, ast.ImportFrom)):
                 self.add(self.idx.file_users_of(self.rel), "import change")
 
-    def import_time_loads(self, names, excl) -> bool:
+    def site_relevant(self, f, ln, nm, base, okey) -> bool:
+        """Whether an import-time read of `nm` can have resolved through the
+        class `okey`. The impbase map (built on the pinned checkout) records
+        the MRO of every object such a read used while importing; a read that
+        never saw `okey` in it cannot have observed `okey.nm`. Unknown sites,
+        bare names and classes the tracer never named stay relevant."""
+        if okey is None or base is None or base == "?":
+            return True
+        ib = getattr(self.idx, "impbase", None)
+        if not ib or not self.idx.users.get(okey):
+            return True
+        seen = ib.get((f, ln, nm))
+        if seen is None:
+            return True
+        b = self.idx.impbase_cls.get(okey)
+        return b is not None and bool(seen >> b & 1)
+
+    def import_time_loads(self, names, excl, okey=None) -> bool:
         for nm in names:
             for f, ln, base, in_func in self.idx.imp_name_sites.get(nm, ()):
                 if f == self.rel and ln in excl:
                     continue
+                if not self.site_relevant(f, ln, nm, base, okey):
+                    continue
                 return True
         return False
 
-    def consumers(self, names, excl, owner) -> int:
+    def consumers(self, names, excl, owner, okey=None) -> int:
         """Import-time code that reads one of `names` (outside the changed
         statement) builds derived definitions: every importer of that file."""
         acc = 0
         for nm in names:
             for f, ln, base, in_func in self.idx.imp_name_sites.get(nm, ()):
                 if f == self.rel and ln in excl:
+                    continue
+                if not self.site_relevant(f, ln, nm, base, okey):
                     continue
                 if owner is not None:
                     # attribute of a class: only references through that class

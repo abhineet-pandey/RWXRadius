@@ -28,15 +28,25 @@ LABEL_OUT = os.environ.get("BR_LABEL_OUT")  # local-only: replay everything, dum
 # CPU model (server seconds). Replaying a test costs about its recorded time;
 # a commit's child costs a fixed amount plus per test-module import.
 CPU_RATIO = float(os.environ.get("BR_CPU_RATIO", "1.15"))
-CHILD_BASE_MS = int(os.environ.get("BR_CHILD_BASE_MS", "120"))
-MODULE_IMPORT_MS = {"tests/test_executor.py": 800, "tests/test_optimizer.py": 120}
-DEFAULT_MODULE_MS = 40
+# measured (fork + fresh sqlglot import from the overlay): ~0.28 s; importing a
+# dialect test module also imports its dialect (~0.15 s); test_optimizer
+# imports and sets up much more (~1 s for a handful of cheap tests)
+CHILD_BASE_MS = int(os.environ.get("BR_CHILD_BASE_MS", "300"))
+MODULE_IMPORT_MS = {"tests/test_executor.py": 800, "tests/test_optimizer.py": 650,
+                    "tests/test_parser.py": 50, "tests/test_expressions.py": 20}
+DEFAULT_MODULE_MS = 150
 CLASS_SETUP_MS = {"tests/test_executor.py::TestExecutor": 1200}  # measured: import+setUpClass ~1.75 s
 HEAVY_MODULES = ("tests/test_executor.py", "tests/test_optimizer.py")
 PER_COMMIT_WALL_S = 6.0  # 180 s / 30 commits (practice), 270 s / 45 (final)
-# once one replayed test fails the commit needs a worker anyway: stop if the
-# candidates left are cheap enough that dropping them saves little
-STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", "1500"))
+# Once one replayed test fails the commit needs a worker anyway. Including the
+# remaining candidates blind costs at most their summed duration (less when
+# they spread over workers), replaying them costs at least that in CPU: stop.
+STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", str(10 ** 9)))
+# Replay only pays off when every replayed candidate passes; a failure means
+# the CPU is spent and a worker is needed anyway. Prior probability that the
+# replayed candidates of a commit all pass (half the sample's code commits with
+# candidates break something).
+P_PASS = float(os.environ.get("BR_P_PASS", "0.5"))
 FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0, "tests/test_generator.py": 0.85}
 
 
@@ -122,14 +132,14 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num):
             continue
         rest_n = len(order) - i - 1 + len(forced_set)
         rest_max = max(f_max, dur[order[-1]] if i + 1 < len(order) else 0)
-        net = base_cost - lb_cost(f_total + suffix_total[i + 1], rest_max, rest_n) - cpu
+        net = P_PASS * (base_cost - lb_cost(f_total + suffix_total[i + 1], rest_max, rest_n)) - cpu
         if net > best_net:
             best_net, best_i = net, i + 1
     if best_i == 0:
         return [], allsel, base_cost, 0
     rep = order[:best_i]
     blind = sorted(forced_set | set(order[best_i:]))
-    net = base_cost - sched_cost(blind, dur) - replay_cpu_ms(rep, tests_by_num, dur)
+    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur)
     if net <= 0:
         return [], allsel, base_cost, 0
     # tests that fit into the blind schedule's slack are free: no replay needed

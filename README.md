@@ -23,6 +23,7 @@ pinned commit with a tracer (`tools/brmap_plugin.py`, `sys.monitoring`):
 | identifier → tests | tests executing a line that mentions an identifier |
 | import-time lines | lines executed while importing sqlglot, all dialects and the test modules |
 | collection imports | modules each test file imports when collected |
+| import-time read bases | for every attribute read that runs while importing, the classes (whole MRO) of the object it read from (`tools/impbase_pass.py`) |
 
 Process pools used by the tests are traced in-process with the same pickle
 round-trip a real pool performs (sqlglot expressions pickle via `serde`). The
@@ -42,7 +43,16 @@ baseline tree and classified:
   bodies): everything that imports the module.
 * **Definition-time code** (class attributes, decorators, defaults, module
   constants, imports): users of the class and its subclasses, readers of the
-  identifier, and any import-time code that copies it.
+  identifier, and any import-time code that copies it. An import-time read
+  only counts when the import-time base map shows it actually read from the
+  changed class (or a subclass); unknown sites stay conservative.
+* **Function signatures** (parameters, defaults, annotations of an undecorated
+  `def`): the tests that executed the function body — every call that
+  completed at the baseline ran it, while the `def` line and default values run
+  at import for every importer. Decorated functions keep the broader scope.
+* **Renamed / replaced methods** (undecorated): callers of the old body, plus
+  class users reading any newly introduced name (`dir()`-based `*_sql`
+  dispatch included) and import-time consumers of old and new names.
 * **AST-identical edits** (comments, formatting): only tests that read the file
   as text. **Docstrings**: readers of `__doc__`.
 * **Data files** (SQL fixtures etc.): tests that opened them; added/removed
@@ -62,7 +72,10 @@ then runs the candidate `unittest` cases. A test is dropped only if it ran to
 completion with no failure, error, failing subtest, unexpected success or
 timeout; anything else, including a crashed or killed child, keeps it.
 
-Replay costs CPU, which is charged, so it is planned per commit: candidates are
+A child stops at the first failing test: the commit then needs a worker
+anyway, and including the remaining candidates blind never costs more than
+replaying them. Replay costs CPU, which is charged, so it is planned per commit
+(fixed cost per child ≈ 0.3 s for a fresh sqlglot import, measured): candidates are
 replayed cheapest first up to the threshold that maximises
 `cost(all candidates) − cost(un-replayed) − replay CPU`. Expensive tests whose
 replay would cost about what including them costs are included without
@@ -95,5 +108,7 @@ for s in 0 1 2; do
     PYTHONPATH=$PWD:/path/to/tools python -m pytest -p brmap_plugin -n auto --dist loadscope tests
 done
 python tools/import_pass.py $PWD import_pass.pkl
-python tools/build_index.py $PWD tests.json maps/index.pkl.gz import_pass.pkl maps_s0 maps_s1 maps_s2
+python tools/build_index.py $PWD tests.json index_base.pkl.gz import_pass.pkl maps_s0 maps_s1 maps_s2
+python tools/impbase_pass.py $PWD index_base.pkl.gz impbase.pkl
+python tools/merge_impbase.py index_base.pkl.gz impbase.pkl maps/index.pkl.gz
 ```
