@@ -20,6 +20,7 @@ output*
 maps/*
 !maps/index.pkl.gz
 !maps/keys.pkl.gz
+!maps/cpu.json
 map_*/
 iso_*/
 cmp_*/

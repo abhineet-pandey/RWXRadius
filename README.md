@@ -103,6 +103,23 @@ replayed cheapest first up to the threshold that maximises
 replay would cost about what including them costs are included without
 replay, and tests that fit in the schedule's slack are included for free.
 
+### 3b. Replay cost model and partial replay
+
+* **Measured CPU** (`maps/cpu.json`): replay CPU of every test, class fixture
+  and test-module import of the pinned checkout, measured in this harness and
+  scaled ×1.3 to the scoring machine. Recorded durations are poor predictors
+  (`test_generator_memory`: 6.7 s recorded, 1.5 s to replay;
+  `test_execute_tpch`: 3.9 s recorded, mostly process spawning). Candidates are
+  replayed in order of CPU per second of schedule they can remove.
+* **Partial replay** (`selector/parts.py`): the long fixture-driven tests
+  (`test_execute_tpcds` 21.5 s, `test_optimized_tpch`, optimizer
+  `test_tpcds`/`test_tpch`) are traced per fixture item as pseudo-tests
+  `T@i`, plus `T@base` with no items (`tools/add_parts.py`). Lines, dict keys,
+  class users and identifier readers are refined per item; every other map
+  credits `T@base` wherever `T` appears. When a commit reaches `T` only
+  through some items, the child runs the real test method with the item list
+  filtered to those items; if they pass, `T` passes.
+
 ### 4. Packing (`selector/schedule.py`)
 
 For every worker count 1..8: longest-processing-time first, then bounded

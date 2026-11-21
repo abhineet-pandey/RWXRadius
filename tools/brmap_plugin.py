@@ -53,9 +53,11 @@ def _bucket(kind):
         return None
     rec = DATA.get(ctx)
     if rec is None:
-        rec = DATA[ctx] = {"lines": {}, "setup": {}, "opens": set(), "recv": set()}
+        rec = DATA[ctx] = {"lines": {}, "setup": {}, "opens": set(), "recv": set(), "recv_setup": set()}
     if kind == "lines":
         return rec["setup"] if _state["phase"] == "setup" else rec["lines"]
+    if kind == "recv" and _state["phase"] == "setup":
+        return rec["recv_setup"]
     return rec[kind]
 
 
@@ -277,7 +279,9 @@ def pytest_sessionfinish(session):
             "lines": {f: sorted(s) for f, s in v["lines"].items()},
             "setup": {f: sorted(s) for f, s in v["setup"].items()},
             "opens": sorted(v["opens"]),
-            "recv": sorted({tname(k) for t in v["recv"] for k in getattr(t, "__mro__", (t,))}),
+            # all receivers (as before), and those seen in class/module fixtures
+            "recv": sorted({tname(k) for t in v["recv"] | v["recv_setup"] for k in getattr(t, "__mro__", (t,))}),
+            "recv_setup": sorted({tname(k) for t in v["recv_setup"] for k in getattr(t, "__mro__", (t,))}),
         }
     with open(os.path.join(OUT, f"map_{wid}.pkl"), "wb") as fh:
         pickle.dump(

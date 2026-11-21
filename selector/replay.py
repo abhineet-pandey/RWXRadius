@@ -210,8 +210,11 @@ def _child(job: dict, wfd: int):
 
         # group: file -> class -> [(nodeid, method, timeout)]
         groups: dict = {}
+        keep_of = {}
         for item in job["tests"]:
             nid, timeout = item[0], item[1]
+            if len(item) > 3 and item[3] is not None:
+                keep_of[nid] = item[3]
             f, c, m = nid.split("::")
             groups.setdefault(f, {}).setdefault(c, []).append((nid, m, timeout))
 
@@ -229,9 +232,14 @@ def _child(job: dict, wfd: int):
 
             def startTest(self, test):
                 super().startTest(test)
+                self._t0 = time.process_time()
                 signal.setitimer(signal.ITIMER_REAL, self.timeouts.get(id(test), 30))
 
             def stopTest(self, test):
+                if job.get("measure"):
+                    nid = self._nid(test)
+                    if nid:
+                        out.setdefault("tcpu", {})[nid] = round(time.process_time() - self._t0, 4)
                 signal.setitimer(signal.ITIMER_REAL, 120)
                 super().stopTest(test)
 
@@ -281,7 +289,7 @@ def _child(job: dict, wfd: int):
                 if nid:
                     passed.add(nid)
 
-        remaining_ms = sum(int(ms) for _, _, ms in job["tests"]) if job["tests"] and len(job["tests"][0]) > 2 else 0
+        remaining_ms = sum(int(x[2]) for x in job["tests"]) if job["tests"] and len(job["tests"][0]) > 2 else 0
         stop_ms = job.get("stop_after_fail_ms", 0)
         dur_of = {x[0]: (x[2] if len(x) > 2 else 0) for x in job["tests"]}
         for f, classes in groups.items():
@@ -299,6 +307,8 @@ def _child(job: dict, wfd: int):
                 continue
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
+            if job.get("measure"):
+                out.setdefault("mcpu", {})[f] = round(time.process_time() - tf, 4)
             for cname, items in classes.items():
                 if failed and remaining_ms <= stop_ms:
                     break
@@ -309,6 +319,11 @@ def _child(job: dict, wfd: int):
                 for nid, meth, timeout in items:
                     try:
                         tc = cls(meth)
+                        if nid in keep_of:
+                            # long fixture-driven test: only the items the change reaches
+                            from .parts import restrict
+
+                            restrict(tc, nid, keep_of[nid])
                     except BaseException:  # noqa
                         failed.add(nid)
                         continue
@@ -321,7 +336,10 @@ def _child(job: dict, wfd: int):
                 res.ids = ids
                 try:
                     signal.setitimer(signal.ITIMER_REAL, 120)
+                    tc0 = time.process_time()
                     unittest.TestSuite(cases).run(res)
+                    if job.get("measure"):
+                        out.setdefault("ccpu", {})[f"{f}::{cname}"] = round(time.process_time() - tc0, 4)
                     for nid, _, _ in items:
                         remaining_ms -= dur_of.get(nid, 0)
                 except BaseException:  # noqa
@@ -371,7 +389,7 @@ class Replayer:
         shutil.rmtree(dest, ignore_errors=True)
         build_overlay(self.repo, overlay, dest)
         job = {"overlay": dest, "probe": probe, "tests": tests, "stop_after_fail_ms": stop_after_fail_ms,
-               "sd": sd, "import_all": import_all}
+               "sd": sd, "import_all": import_all, "measure": bool(os.environ.get("BR_MEASURE"))}
         if _uses_duckdb(dest, {str(t[0]).split("::")[0] for t in tests}):
             # duckdb reserves several GB of address space when it connects: an
             # address-space cap kills the child (measured: 3 GB dies, 4 GB ok),

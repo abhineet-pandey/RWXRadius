@@ -28,10 +28,13 @@ LABEL_OUT = os.environ.get("BR_LABEL_OUT")  # local-only: replay everything, dum
 # CPU model (server seconds). Replaying a test costs about its recorded time;
 # a commit's child costs a fixed amount plus per test-module import.
 CPU_RATIO = float(os.environ.get("BR_CPU_RATIO", "1.15"))
+# maps/cpu.json was measured on a machine ~1.27x faster than the one the
+# durations were recorded on (median over single-process tests): scale up
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))
 # measured (fork + fresh sqlglot import from the overlay): ~0.28 s; importing a
 # dialect test module also imports its dialect (~0.15 s); test_optimizer
 # imports and sets up much more (~1 s for a handful of cheap tests)
-CHILD_BASE_MS = int(os.environ.get("BR_CHILD_BASE_MS", "300"))
+CHILD_BASE_MS = int(os.environ.get("BR_CHILD_BASE_MS", "150"))
 MODULE_IMPORT_MS = {"tests/test_executor.py": 800, "tests/test_optimizer.py": 650,
                     "tests/test_parser.py": 50, "tests/test_expressions.py": 20}
 DEFAULT_MODULE_MS = 150
@@ -46,7 +49,7 @@ STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", str(10 ** 9)))
 # the CPU is spent and a worker is needed anyway. Prior probability that the
 # replayed candidates of a commit all pass (half the sample's code commits with
 # candidates break something).
-P_PASS = float(os.environ.get("BR_P_PASS", "0.5"))
+P_PASS = float(os.environ.get("BR_P_PASS", "0.8"))
 FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0, "tests/test_generator.py": 0.85}
 # State diff (see statefp): importing every sqlglot module from the overlay
 # and fingerprinting it costs about this much CPU on top of a replay child.
@@ -56,6 +59,7 @@ SD_MIN_GAIN_MS = int(os.environ.get("BR_SD_MIN_GAIN_MS", "600"))
 MAPS = os.path.dirname(INDEX)
 KEYS = os.environ.get("BR_KEYS", os.path.join(MAPS, "keys.pkl.gz"))
 STATE = os.environ.get("BR_STATE", os.path.join(MAPS, "state.pkl"))
+CPU_MAP = os.environ.get("BR_CPU_MAP", os.path.join(MAPS, "cpu.json"))
 MODULES = os.environ.get("BR_MODULES", os.path.join(MAPS, "modules.json"))
 IMPORT_ALL_MS = 300
 
@@ -95,6 +99,13 @@ class KeyMap:
         for lab, bk, nk in other:
             mod, _, q = lab.partition(":")
             cls, _, attr = q.rpartition(".")
+            if idx is not None and not cls and bk in ("V", None) and nk in ("V", None):
+                # module-level data: the code that names it (copies made by
+                # other modules while importing are their own changed labels)
+                extra |= idx.names_of(attr)
+                if not attr.isupper():
+                    extra |= idx.names_of("<dynamic>")
+                continue
             if (idx is None or not cls or bk not in ("V", None) or nk not in ("V", None)
                     or not idx.users.get(f"{mod}.{cls}")):
                 return None, f"other state changed: {[x[0] for x in other][:4]}"
@@ -144,7 +155,81 @@ def bits_iter(b: int):
     return [i for i, c in enumerate(s) if c == "1"]
 
 
-def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS) -> int:
+def _load_cpu_map():
+    try:
+        with open(CPU_MAP) as fh:
+            return json.load(fh)
+    except Exception as e:  # noqa
+        log("cpu map unavailable:", e)
+        return {"tests": {}, "classes": {}, "modules": {}}
+
+
+_CPU = None
+
+
+def _cpu():
+    global _CPU
+    if _CPU is None:
+        _CPU = _load_cpu_map()
+    return _CPU
+
+
+def test_cpu_ms(n, tests_by_num, dur) -> float:
+    """Replay CPU of one test: measured on the pinned checkout in this
+    harness (maps/cpu.json) scaled to the scoring machine, else the
+    recorded duration."""
+    ms = _cpu()["tests"].get(tests_by_num[n]["id"])
+    if ms is None:
+        return dur[n] * CPU_RATIO
+    return ms * CPU_FACTOR + 2
+
+
+def file_cpu_ms(f) -> float:
+    ms = _cpu()["modules"].get(f)
+    return DEFAULT_MODULE_MS if ms is None else ms * CPU_FACTOR
+
+
+def class_cpu_ms(c) -> float:
+    return _cpu()["classes"].get(c, 0) * CPU_FACTOR
+
+
+def partial_of(bits: int, idx, num_of_id) -> dict:
+    """Long fixture-driven tests (selector/parts.py) the candidate bits reach
+    only through some of their items: test number -> item indices to replay."""
+    out = {}
+    for tid, p in (getattr(idx, "parts", None) or {}).items():
+        if not bits >> p["real"] & 1 or bits >> p["base"] & 1:
+            continue
+        keep = [i for i, q in enumerate(p["parts"]) if bits >> q & 1]
+        n = num_of_id.get(tid)
+        if keep and n is not None:
+            out[n] = keep
+    return out
+
+
+def whole_items(bits: int, idx) -> int:
+    """`bits` with every item of a partial test whose base it has: a set that
+    holds T@base stands for all of T."""
+    for p in (getattr(idx, "parts", None) or {}).values():
+        if bits >> p["base"] & 1:
+            for q in p["parts"]:
+                bits |= 1 << q
+    return bits
+
+
+def partial_cpu_ms(n, keep, tests_by_num, dur) -> float:
+    from .parts import pseudo_id
+
+    tid = tests_by_num[n]["id"]
+    t = _cpu()["tests"]
+    base = t.get(pseudo_id(tid, "base"))
+    items = [t.get(pseudo_id(tid, i)) for i in keep]
+    if base is None or any(x is None for x in items):
+        return test_cpu_ms(n, tests_by_num, dur)
+    return (base + sum(max(0, x - base) for x in items)) * CPU_FACTOR + 2
+
+
+def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS, partial=None) -> int:
     files = set()
     classes = set()
     total = base_ms
@@ -152,11 +237,12 @@ def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS) -> int:
         t = tests_by_num[n]
         files.add(t["file"])
         classes.add(t["id"].rsplit("::", 1)[0])
-        total += dur[n] * FILE_CPU_RATIO.get(t["file"], CPU_RATIO)
+        total += (partial_cpu_ms(n, partial[n], tests_by_num, dur) if partial and n in partial
+                  else test_cpu_ms(n, tests_by_num, dur))
     for f in files:
-        total += MODULE_IMPORT_MS.get(f, DEFAULT_MODULE_MS)
+        total += file_cpu_ms(f)
     for c in classes:
-        total += CLASS_SETUP_MS.get(c, 0)
+        total += class_cpu_ms(c)
     return int(total)
 
 
@@ -172,7 +258,7 @@ def lb_cost(total: int, longest: int, count: int) -> int:
     return min(max(longest, -(-total // k)) + 2000 * k for k in range(1, min(8, count) + 1))
 
 
-def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHILD_BASE_MS):
+def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHILD_BASE_MS, partial=None):
     """Split candidates into (replay, blind). Replay the cheapest prefix of the
     candidates (by duration) maximising (cost of selecting everything) -
     (cost of the rest) - (replay CPU). Uses the packing lower bound while
@@ -180,14 +266,21 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHIL
     forced_set = set(forced)
     allsel = sorted(set(cand) | forced_set)
     base_cost = sched_cost(allsel, dur)
-    order = sorted(set(cand) - forced_set, key=lambda n: (dur[n], n))
+    # cheapest replay per second of schedule first (a test whose replay costs
+    # far less CPU than its recorded duration comes early, however long)
+    partial = partial or {}
+    tcpu = {n: (partial_cpu_ms(n, partial[n], tests_by_num, dur) if n in partial
+                else test_cpu_ms(n, tests_by_num, dur)) for n in set(cand) - forced_set}
+    order = sorted(tcpu, key=lambda n: ((tcpu[n] + 20) / (dur[n] + 20), dur[n], n))
     if not order:
         return [], allsel, base_cost, 0
     f_total = sum(dur[n] for n in forced_set)
     f_max = max((dur[n] for n in forced_set), default=0)
     suffix_total = [0] * (len(order) + 1)
+    suffix_max = [0] * (len(order) + 1)
     for i in range(len(order) - 1, -1, -1):
         suffix_total[i] = suffix_total[i + 1] + dur[order[i]]
+        suffix_max[i] = max(suffix_max[i + 1], dur[order[i]])
     files, classes = set(), set()
     cpu = base_ms
     best_net, best_i = 0, 0
@@ -195,16 +288,14 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHIL
         t = tests_by_num[n]
         if t["file"] not in files:
             files.add(t["file"])
-            cpu += MODULE_IMPORT_MS.get(t["file"], DEFAULT_MODULE_MS)
+            cpu += file_cpu_ms(t["file"])
         c = t["id"].rsplit("::", 1)[0]
         if c not in classes:
             classes.add(c)
-            cpu += CLASS_SETUP_MS.get(c, 0)
-        cpu += dur[n] * FILE_CPU_RATIO.get(t["file"], CPU_RATIO)
-        if i + 1 < len(order) and dur[order[i + 1]] == dur[n]:
-            continue
+            cpu += class_cpu_ms(c)
+        cpu += tcpu[n]
         rest_n = len(order) - i - 1 + len(forced_set)
-        rest_max = max(f_max, dur[order[-1]] if i + 1 < len(order) else 0)
+        rest_max = max(f_max, suffix_max[i + 1])
         net = P_PASS * (base_cost - lb_cost(f_total + suffix_total[i + 1], rest_max, rest_n)) - cpu
         if net > best_net:
             best_net, best_i = net, i + 1
@@ -212,7 +303,7 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHIL
         return [], allsel, base_cost, 0
     rep = order[:best_i]
     blind = sorted(forced_set | set(order[best_i:]))
-    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur, base_ms)
+    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur, base_ms, partial)
     if net <= 0:
         return [], allsel, base_cost, 0
     # tests that fit into the blind schedule's slack are free: no replay needed
@@ -225,27 +316,31 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHIL
     return rep, blind, base_cost, net
 
 
-def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_nums):
+def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_nums, num_of_id):
     """Planner run inside the replay child once the state diff is known.
     Falls back to the commit's static plan when the diff is not explained."""
     rest, forced = pl["sd"]["rest"], pl["forced"]
     static_keyed = set(to_nums(pl["an"].keyed)) | set(pl["sd"]["unknown"])
 
-    def job(nums):
-        return [(tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n])
+    def job(nums, partial=None):
+        partial = partial or {}
+        return [(tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n], partial.get(n))
                 for n in sorted(nums, key=lambda n: (dur[n], n))]
 
     def plan(res):
         bits, note = km.readers(res, changed_mods, idx)
         if bits is None:
-            return job(pl["replay"]), list(pl["replay"]), list(pl["blind"]), "fallback: " + note
+            return (job(pl["replay"], pl.get("partial")), list(pl["replay"]), list(pl["blind"]),
+                    "fallback: " + note)
         kbits, ibits = bits
         # both the diff's readers and the static keyed candidates are supersets
         narrowed = (set(km_nums(kbits)) | set(to_nums(ibits))) & static_keyed
         cand = (rest | narrowed) - forced
+        partial = partial_of(pl["an"].other | ((kbits | ibits) & whole_items(pl["an"].keyed, idx)), idx, num_of_id)
         # the child already paid for its start and sqlglot import
-        rep, blind, _, _ = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num, base_ms=0)
-        return job(rep), list(rep), list(blind), f"{note} -> {len(cand)} cand"
+        rep, blind, _, _ = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num, base_ms=0,
+                                       partial=partial)
+        return job(rep, partial), list(rep), list(blind), f"{note} -> {len(cand)} cand"
 
     return plan
 
@@ -353,16 +448,20 @@ def main():
             forced = set()
             rep, blind, base_cost, net = sorted(cand), [], 0, 1
         else:
-            rep, blind, base_cost, net = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num)
+            partial = partial_of(a.cand, idx, num_of_id) if cand else {}
+            partial = {n: k for n, k in partial.items() if n in cand}
+            rep, blind, base_cost, net = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num,
+                                                     partial=partial)
         plans[cid] = {"replay": rep, "blind": blind, "an": a, "base": base_cost, "net": net,
-                      "ncand": len(cand), "nforced": len(forced), "cand": cand, "forced": forced}
+                      "ncand": len(cand), "nforced": len(forced), "cand": cand, "forced": forced,
+                      "partial": {n: k for n, k in partial.items() if n in rep} if not LABEL_OUT else {}}
         if a.keyed and a.replayable and a.code_changed and not NO_SD and not LABEL_OUT:
             # what the keyed part costs at most: the plan without it
             rest = (set(to_nums(a.other)) | (set(unknown) if a.other else set())) - forced
             r_rep, r_blind, _, r_net = plan_replay(sorted(rest), sorted(forced), dur, tests_by_num)
             # expected cost of the static plan if its replays pass, against the
             # best case of the diff (keyed candidates all dropped) plus its CPU
-            static = sched_cost(blind, dur) + (replay_cpu_ms(rep, tests_by_num, dur) if rep else 0)
+            static = sched_cost(blind, dur) + (replay_cpu_ms(rep, tests_by_num, dur, partial=partial) if rep else 0)
             narrow = sched_cost(r_blind, dur) + replay_cpu_ms(r_rep, tests_by_num, dur) + SD_CPU_MS
             gain = static - narrow
             if gain > SD_MIN_GAIN_MS:
@@ -394,7 +493,7 @@ def main():
             log(f"{cid}: no state diff, untracked {untracked[:3]}")
             del pl["sd"]
             continue
-        pl["sd"]["plan"] = make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, to_nums)
+        pl["sd"]["plan"] = make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, to_nums, num_of_id)
         pl["net"] = max(pl["net"], pl["sd"]["gain"])
         pl["sd_tag"] = True
 
@@ -433,7 +532,7 @@ def main():
                 cid = queue.pop(0)
                 pl = plans[cid]
                 now = time.monotonic()
-                est = replay_cpu_ms(pl["replay"], tests_by_num, dur) / 1000.0
+                est = replay_cpu_ms(pl["replay"], tests_by_num, dur, partial=pl.get("partial")) / 1000.0
                 if "sd" in pl:
                     est += SD_CPU_MS / 1000.0
                 elif pl["an"].needs_probe:
@@ -445,9 +544,14 @@ def main():
                 a = pl["an"]
                 # cheapest first, so a breaking change is usually caught early
                 job_tests = [
-                    (tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n])
+                    (tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n],
+                     pl.get("partial", {}).get(n))
                     for n in sorted(pl["replay"], key=lambda n: (dur[n], n))
                 ]
+                if pl.get("partial"):
+                    log(f"{cid}: partial replay "
+                        + ", ".join(f"{tests_by_num[n]['id'].rsplit('::', 1)[1]}[{len(k)}]"
+                                    for n, k in pl["partial"].items()))
                 deadline = now + 30 + est * 6
                 try:
                     rp.start(cid, a.overlay, [m for m in a.probe_modules if m], job_tests, deadline,

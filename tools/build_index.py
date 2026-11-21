@@ -47,6 +47,76 @@ def collect_closure(args):
         return mod, [False, []]
 
 
+def scan_names(root, imptime):
+    """Identifier -> {file: lines mentioning it}, plus import-time sites of
+    each identifier (file, line, base, inside a function)."""
+    name_lines: dict = defaultdict(lambda: defaultdict(set))
+    imp_name_sites: dict = defaultdict(set)
+    py_files = []
+    for sub in ("sqlglot", "tests"):
+        for dp, dn, fns in os.walk(os.path.join(root, sub)):
+            dn[:] = [x for x in dn if x not in ("__pycache__", "fixtures")]
+            for f in fns:
+                if f.endswith(".py"):
+                    py_files.append(os.path.relpath(os.path.join(dp, f), root))
+    for rel in sorted(py_files):
+        try:
+            tree = ast.parse(open(os.path.join(root, rel), "rb").read())
+        except SyntaxError:
+            continue
+        it = imptime.get(rel, frozenset())
+        stack = [(tree, False)]
+        while stack:
+            node, in_func = stack.pop()
+            keys = ()
+            lo = hi = None
+            base = None
+            if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Store):
+                keys, lo, hi = (node.id,), node.lineno, node.end_lineno
+            elif isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Store):
+                v = node.value
+                base = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else "?"
+                keys, lo, hi = (node.attr, f"{base}.{node.attr}"), node.end_lineno, node.end_lineno
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                keys, lo, hi = (node.value,), node.lineno, node.end_lineno
+                base = "?"
+            elif isinstance(node, ast.alias):
+                keys = (node.name.split(".")[-1], (node.asname or node.name).split(".")[0])
+                lo, hi = node.lineno, node.end_lineno
+                base = "?"
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                fname = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
+                dyn = False
+                if fname in ("getattr", "setattr", "hasattr", "delattr") and len(node.args) >= 2:
+                    dyn = not isinstance(node.args[1], ast.Constant)
+                elif fname in ("vars", "dir", "getmembers", "getattr_static"):
+                    dyn = True
+                if dyn:
+                    for ln in range(node.lineno, node.end_lineno + 1):
+                        name_lines["<dynamic>"][rel].add(ln)
+            if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+                for ln in range(node.lineno, node.end_lineno + 1):
+                    name_lines["<dynamic>"][rel].add(ln)
+            for nm in keys:
+                for ln in range(lo, hi + 1):
+                    name_lines[nm][rel].add(ln)
+                    if ln in it and "." not in nm:
+                        imp_name_sites[nm].add((rel, ln, base, in_func))
+            for f in node._fields:
+                v = getattr(node, f, None)
+                child_func = in_func or (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and f == "body"
+                ) or (isinstance(node, ast.Lambda) and f == "body")
+                if isinstance(v, list):
+                    for x in v:
+                        if isinstance(x, ast.AST):
+                            stack.append((x, child_func))
+                elif isinstance(v, ast.AST):
+                    stack.append((v, child_func))
+    return name_lines, imp_name_sites, py_files
+
+
 def main():
     root, tests_json, out, imp_pkl = sys.argv[1:5]
     map_dirs = sys.argv[5:]
@@ -142,70 +212,7 @@ def main():
     imptime = {fn: frozenset(ls) for fn, ls in imp["lines"].items()}
 
     # ---- identifier readers (runtime lines) and import-time identifier sites
-    name_lines: dict = defaultdict(lambda: defaultdict(set))
-    imp_name_sites: dict = defaultdict(set)
-    py_files = []
-    for sub in ("sqlglot", "tests"):
-        for dp, dn, fns in os.walk(os.path.join(root, sub)):
-            dn[:] = [x for x in dn if x not in ("__pycache__", "fixtures")]
-            for f in fns:
-                if f.endswith(".py"):
-                    py_files.append(os.path.relpath(os.path.join(dp, f), root))
-    for rel in sorted(py_files):
-        try:
-            tree = ast.parse(open(os.path.join(root, rel), "rb").read())
-        except SyntaxError:
-            continue
-        it = imptime.get(rel, frozenset())
-        stack = [(tree, False)]
-        while stack:
-            node, in_func = stack.pop()
-            keys = ()
-            lo = hi = None
-            base = None
-            if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Store):
-                keys, lo, hi = (node.id,), node.lineno, node.end_lineno
-            elif isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Store):
-                v = node.value
-                base = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else "?"
-                keys, lo, hi = (node.attr, f"{base}.{node.attr}"), node.end_lineno, node.end_lineno
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
-                keys, lo, hi = (node.value,), node.lineno, node.end_lineno
-                base = "?"
-            elif isinstance(node, ast.alias):
-                keys = (node.name.split(".")[-1], (node.asname or node.name).split(".")[0])
-                lo, hi = node.lineno, node.end_lineno
-                base = "?"
-            elif isinstance(node, ast.Call):
-                fn = node.func
-                fname = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
-                dyn = False
-                if fname in ("getattr", "setattr", "hasattr", "delattr") and len(node.args) >= 2:
-                    dyn = not isinstance(node.args[1], ast.Constant)
-                elif fname in ("vars", "dir", "getmembers", "getattr_static"):
-                    dyn = True
-                if dyn:
-                    for ln in range(node.lineno, node.end_lineno + 1):
-                        name_lines["<dynamic>"][rel].add(ln)
-            if isinstance(node, ast.Attribute) and node.attr == "__dict__":
-                for ln in range(node.lineno, node.end_lineno + 1):
-                    name_lines["<dynamic>"][rel].add(ln)
-            for nm in keys:
-                for ln in range(lo, hi + 1):
-                    name_lines[nm][rel].add(ln)
-                    if ln in it and "." not in nm:
-                        imp_name_sites[nm].add((rel, ln, base, in_func))
-            for f in node._fields:
-                v = getattr(node, f, None)
-                child_func = in_func or (
-                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and f == "body"
-                ) or (isinstance(node, ast.Lambda) and f == "body")
-                if isinstance(v, list):
-                    for x in v:
-                        if isinstance(x, ast.AST):
-                            stack.append((x, child_func))
-                elif isinstance(v, ast.AST):
-                    stack.append((v, child_func))
+    name_lines, imp_name_sites, py_files = scan_names(root, imptime)
     names_idx = {}
     for nm, files in name_lines.items():
         acc = 0
