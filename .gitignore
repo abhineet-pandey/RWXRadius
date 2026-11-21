@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local data / evaluation output (never ship labels or sample answers)
+sample/
+data/
+answers.json
+*.jsonl
+*.log
+output*
+
+# Raw tracing output; only maps/index.pkl.gz is committed
+maps/*
+!maps/index.pkl.gz
+map_*/
+iso_*/
+cmp_*/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
