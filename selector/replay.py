@@ -19,6 +19,18 @@ import time
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
 
+def _uses_duckdb(root: str, files) -> bool:
+    """Whether any of these test files (as patched) mentions duckdb."""
+    for f in files:
+        try:
+            with open(os.path.join(root, f), "rb") as fh:
+                if b"duckdb" in fh.read():
+                    return True
+        except OSError:
+            return True  # unknown: do not risk an address-space kill
+    return False
+
+
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
@@ -314,6 +326,15 @@ class Replayer:
         shutil.rmtree(dest, ignore_errors=True)
         build_overlay(self.repo, overlay, dest)
         job = {"overlay": dest, "probe": probe, "tests": tests, "stop_after_fail_ms": stop_after_fail_ms}
+        if _uses_duckdb(dest, {str(t[0]).split("::")[0] for t in tests}):
+            # duckdb reserves several GB of address space when it connects: an
+            # address-space cap kills the child (measured: 3 GB dies, 4 GB ok),
+            # losing every result of the commit. The container's memory limit
+            # still bounds a runaway mutant; the kernel then kills this child,
+            # whose candidates are all kept.
+            job["mem_headroom"] = 16384 << 20
+        if os.environ.get("BR_MEM_HEADROOM_MB"):
+            job["mem_headroom"] = int(os.environ["BR_MEM_HEADROOM_MB"]) << 20
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
