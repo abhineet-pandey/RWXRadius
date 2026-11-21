@@ -757,8 +757,23 @@ def _config_breaks_pytest(rel: str, new_text) -> bool:
 
 
 def _listers(idx: Index, rel: str) -> int:
+    """Tests that can notice a file appearing or disappearing in a directory:
+    only code that enumerates directories itself. The import system also lists
+    package directories, but only to resolve module names something already
+    imports (importers are handled separately); pytest's collection scan only
+    decides which test modules exist (a changed test module is analysed as
+    such, conftest.py and pytest configuration as configuration)."""
+    real = getattr(idx, "lists_real", None)
+    use_real = real is not None
     acc = 0
     parts = rel.split("/")
     for i in range(len(parts)):
-        acc |= idx.lists_of("/".join(parts[:i]) or ".")
+        d = "/".join(parts[:i]) or "."
+        if use_real:
+            if d == ".":
+                continue  # pytest's scan of the root only collects under tests/
+            k = real.get(d)
+            acc |= idx.sets[k] if k is not None else 0
+        else:
+            acc |= idx.lists_of(d)
     return acc

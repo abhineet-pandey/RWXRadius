@@ -65,6 +65,11 @@ MODULES = os.environ.get("BR_MODULES", os.path.join(MAPS, "modules.json"))
 IMPORT_ALL_MS = 300
 
 
+# interpreter machinery that cannot be fingerprinted and never holds patched
+# data: ABC registration caches, lazy-import locks
+_RUNTIME_ONLY = {"_abc_impl", "_import_lock"}
+
+
 class KeyMap:
     """Baseline dict-entry readers (maps/keys.pkl.gz) and import-time state
     fingerprints (maps/state.pkl, built in the image). Loaded on first use."""
@@ -95,7 +100,8 @@ class KeyMap:
         if res is None:
             return None, "no diff"
         keyed, other = res
-        other = [x for x in other if not (x[0] in self.noisy and x[0].split(":")[0] not in changed_mods)]
+        other = [x for x in other if not (x[0] in self.noisy and x[0].split(":")[0] not in changed_mods)
+                 and x[0].rsplit(".", 1)[-1].rsplit(":", 1)[-1] not in _RUNTIME_ONLY]
         extra = 0
         for lab, bk, nk in other:
             mod, _, q = lab.partition(":")
@@ -498,10 +504,20 @@ def main():
         if km is None or not a.keyed_modules <= km.mod_set or not (changed_mods - {None}) <= km.mod_set:
             del pl["sd"]
             continue
-        # the assigned names must be tracked dicts, or the diff cannot be explained
-        untracked = [x for x in a.keyed_labels if x is None or x not in km.aliases or km.aliases[x] in km.leaky]
-        if untracked:
-            log(f"{cid}: no state diff, untracked {untracked[:3]}")
+        # A diff can only beat the static rules when something assigned is a
+        # tracked dict (per-entry readers), a module-level name or a new name
+        # (identifier readers instead of every importer), or an unknown
+        # statement. Existing non-dict class attributes get the same rule
+        # (class users x identifier readers) either way: no child for those.
+        def useful(x):
+            if x is None or x not in km.state:
+                return True
+            if km.state[x][0].startswith("D"):
+                return x in km.aliases and km.aliases[x] not in km.leaky
+            return "." not in x.split(":", 1)[1]
+
+        if not any(useful(x) for x in a.keyed_labels):
+            log(f"{cid}: no state diff, class constants only {sorted(a.keyed_labels)[:3]}")
             del pl["sd"]
             continue
         pl["sd"]["plan"] = make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, to_nums, num_of_id)
