@@ -110,6 +110,21 @@ def _on_alarm(signum, frame):
     raise _Timeout()
 
 
+class _StopAfterFail(list):
+    """Test list of a suite that, once the commit has a failing test, skips the
+    cases not worth replaying any more. Skipped cases never pass, so they
+    stay selected."""
+
+    def __init__(self, cases, skip):
+        super().__init__(cases)
+        self._skip = skip
+
+    def __iter__(self):
+        for tc in list.__iter__(self):
+            if not self._skip(tc):
+                yield tc
+
+
 # ---------------------------------------------------------------- child
 def _child(job: dict, wfd: int):
     import importlib
@@ -211,10 +226,15 @@ def _child(job: dict, wfd: int):
         # group: file -> class -> [(nodeid, method, timeout)]
         groups: dict = {}
         keep_of = {}
+        # tests still worth replaying once the commit is known to fail (their
+        # replay is cheap against the schedule time they remove)
+        worth = set()
         for item in job["tests"]:
             nid, timeout = item[0], item[1]
             if len(item) > 3 and item[3] is not None:
                 keep_of[nid] = item[3]
+            if len(item) > 4 and item[4]:
+                worth.add(nid)
             f, c, m = nid.split("::")
             groups.setdefault(f, {}).setdefault(c, []).append((nid, m, timeout))
 
@@ -292,9 +312,12 @@ def _child(job: dict, wfd: int):
         remaining_ms = sum(int(x[2]) for x in job["tests"]) if job["tests"] and len(job["tests"][0]) > 2 else 0
         stop_ms = job.get("stop_after_fail_ms", 0)
         dur_of = {x[0]: (x[2] if len(x) > 2 else 0) for x in job["tests"]}
+        def worth_left(classes):
+            return any(nid in worth for cl in classes.values() for nid, _, _ in cl)
+
         for f, classes in groups.items():
-            if failed and remaining_ms <= stop_ms:
-                break
+            if failed and remaining_ms <= stop_ms and not worth_left(classes):
+                continue
             modname = f[:-3].replace("/", ".")
             tf = time.process_time()
             try:
@@ -310,8 +333,8 @@ def _child(job: dict, wfd: int):
             if job.get("measure"):
                 out.setdefault("mcpu", {})[f] = round(time.process_time() - tf, 4)
             for cname, items in classes.items():
-                if failed and remaining_ms <= stop_ms:
-                    break
+                if failed and remaining_ms <= stop_ms and not any(nid in worth for nid, _, _ in items):
+                    continue
                 cls = getattr(mod, cname, None)
                 cases = []
                 ids = {}
@@ -337,7 +360,11 @@ def _child(job: dict, wfd: int):
                 try:
                     signal.setitimer(signal.ITIMER_REAL, 120)
                     tc0 = time.process_time()
-                    unittest.TestSuite(cases).run(res)
+                    suite = unittest.TestSuite()
+                    suite._cleanup = False
+                    suite._tests = _StopAfterFail(cases, lambda tc: (
+                        failed and remaining_ms <= stop_ms and ids.get(id(tc)) not in worth))
+                    suite.run(res)
                     if job.get("measure"):
                         out.setdefault("ccpu", {})[f"{f}::{cname}"] = round(time.process_time() - tc0, 4)
                     for nid, _, _ in items:

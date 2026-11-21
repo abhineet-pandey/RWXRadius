@@ -49,7 +49,8 @@ STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", str(10 ** 9)))
 # the CPU is spent and a worker is needed anyway. Prior probability that the
 # replayed candidates of a commit all pass (half the sample's code commits with
 # candidates break something).
-P_PASS = float(os.environ.get("BR_P_PASS", "0.8"))
+P_PASS = float(os.environ.get("BR_P_PASS", "0.5"))
+AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL_RATIO", "0.4"))
 FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0, "tests/test_generator.py": 0.85}
 # State diff (see statefp): importing every sqlglot module from the overlay
 # and fingerprinting it costs about this much CPU on top of a replay child.
@@ -207,6 +208,15 @@ def partial_of(bits: int, idx, num_of_id) -> dict:
     return out
 
 
+def worth_after_fail(n, partial, tests_by_num, dur) -> bool:
+    """Once a commit has a failing test it needs a worker anyway: including a
+    candidate blind then costs at most its duration, so only replays far
+    cheaper than that remain worth their CPU."""
+    c = (partial_cpu_ms(n, partial[n], tests_by_num, dur) if partial and n in partial
+         else test_cpu_ms(n, tests_by_num, dur))
+    return c < AFTER_FAIL_RATIO * dur[n]
+
+
 def whole_items(bits: int, idx) -> int:
     """`bits` with every item of a partial test whose base it has: a set that
     holds T@base stands for all of T."""
@@ -324,7 +334,8 @@ def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_
 
     def job(nums, partial=None):
         partial = partial or {}
-        return [(tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n], partial.get(n))
+        return [(tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n], partial.get(n),
+                 worth_after_fail(n, partial, tests_by_num, dur))
                 for n in sorted(nums, key=lambda n: (dur[n], n))]
 
     def plan(res):
@@ -545,7 +556,7 @@ def main():
                 # cheapest first, so a breaking change is usually caught early
                 job_tests = [
                     (tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n],
-                     pl.get("partial", {}).get(n))
+                     pl.get("partial", {}).get(n), worth_after_fail(n, pl.get("partial"), tests_by_num, dur))
                     for n in sorted(pl["replay"], key=lambda n: (dur[n], n))
                 ]
                 if pl.get("partial"):
