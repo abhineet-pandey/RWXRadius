@@ -30,7 +30,7 @@ LABEL_OUT = os.environ.get("BR_LABEL_OUT")  # local-only: replay everything, dum
 CPU_RATIO = float(os.environ.get("BR_CPU_RATIO", "1.15"))
 # maps/cpu.json was measured on a machine ~1.27x faster than the one the
 # durations were recorded on (median over single-process tests): scale up
-CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.3"))
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "2.0"))
 # measured (fork + fresh sqlglot import from the overlay): ~0.28 s; importing a
 # dialect test module also imports its dialect (~0.15 s); test_optimizer
 # imports and sets up much more (~1 s for a handful of cheap tests)
