@@ -223,6 +223,7 @@ def _child(job: dict, wfd: int):
             job["tests"] = tests
             out["sd"] = {"rep": rep, "blind": blind, "note": note}
 
+        out["pre_cpu"] = round(time.process_time() - t0, 3)
         # group: file -> class -> [(nodeid, method, timeout)]
         groups: dict = {}
         keep_of = {}
@@ -330,8 +331,7 @@ def _child(job: dict, wfd: int):
                 continue
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
-            if job.get("measure"):
-                out.setdefault("mcpu", {})[f] = round(time.process_time() - tf, 4)
+            out.setdefault("mcpu", {})[f] = round(time.process_time() - tf, 4)
             for cname, items in classes.items():
                 if failed and remaining_ms <= stop_ms and not any(nid in worth for nid, _, _ in items):
                     continue

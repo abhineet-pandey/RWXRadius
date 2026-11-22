@@ -451,7 +451,7 @@ def main():
         if unknown and (a.cand or a.forced):
             cand |= set(unknown)
         cand -= forced
-        if not a.code_changed and REPLAY_DATA_ONLY is False:
+        if not a.code_changed and REPLAY_DATA_ONLY is False and not a.item_fixture:
             # only data files changed: their direct readers nearly always
             # fail, so replaying them is wasted CPU
             forced |= cand
@@ -639,6 +639,9 @@ def main():
                     sel |= set(rep) - ran
                     log(f"{cid}: replayed {len(rep)} in {r.get('cpu')}s cpu -> {len(failed)} failing {r.get('t')}")
         r = results.get(cid)
+        if r is not None and "cpu" in r:
+            log(f"{cid}: CPU child={r.get('cpu')} pre={r.get('pre_cpu')} "
+                f"imports={round(sum(r.get('mcpu', {}).values()), 3)} sd={'sd' in r}")
         if r is not None and r.get("import_fail"):
             # modules that imported at the baseline and no longer do: every
             # test importing them (or running their code) fails

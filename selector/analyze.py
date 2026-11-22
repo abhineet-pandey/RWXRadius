@@ -115,6 +115,8 @@ class Analysis:
     other: int = 0
     keyed_modules: set = field(default_factory=set)
     keyed_labels: set = field(default_factory=set)  # state labels assigned; None = unknown
+    item_fixture: bool = False  # a TPC fixture edit narrowed to its changed items: replay it
+    paths: set = field(default_factory=set)  # every path the patch touches
 
 
 def _op_result(op, sig):
@@ -602,6 +604,8 @@ def analyze(patch_text: str, idx: Index, repo_root: str) -> Analysis:
         an.notes.append("empty patch")
         return an
     for fp in fps:
+        an.paths.update(p for p in (fp.old_path, fp.new_path) if p)
+    for fp in fps:
         try:
             _analyze_file(fp, idx, repo_root, an)
         except Exception as e:  # noqa
@@ -657,8 +661,11 @@ def _analyze_file(fp: patchparse.FilePatch, idx: Index, root: str, an: Analysis)
 
     # Files read as data (fixtures, sources read as text) and directory scans
     for rel in rels:
-        an.other |= idx.opens_of(rel)
-        an.cand |= idx.opens_of(rel)
+        b = _item_fixture_readers(fp, rel, idx, root, old_text, new_text, an)
+        if b is None:
+            b = idx.opens_of(rel)
+        an.other |= b
+        an.cand |= b
         if fp.is_new or fp.is_deleted or fp.rename:
             an.other |= _listers(idx, rel)
             an.cand |= _listers(idx, rel)
@@ -726,6 +733,72 @@ def _analyze_file(fp: patchparse.FilePatch, idx: Index, root: str, an: Analysis)
     pa = PyAnalyzer(idx, rel, old_tree, an)
     for site in sites:
         pa.handle(site)
+
+
+def _item_fixture_readers(fp, rel, idx, root, old_text, new_text, an):
+    """Readers of an edited TPC fixture, by changed item (selector/parts.py),
+    or None to keep every reader of the file."""
+    from .parts import ITEM_CONSUMERS, ITEM_LOADING_CLASSES, PARTS, fixture_items
+
+    fixture = rel[len("tests/fixtures/"):] if rel.startswith("tests/fixtures/") else None
+    parts = getattr(idx, "parts", None)
+    if (fixture not in ITEM_CONSUMERS or not parts or fp.is_new or fp.is_deleted or fp.rename
+            or fp.binary or old_text is None or new_text is None or "tests/helpers.py" in an.paths):
+        return None
+    try:
+        old_items = fixture_items(root, old_text)
+        new_items = fixture_items(root, new_text)
+    except Exception:  # noqa
+        return None
+    # Each test checks every item on its own (the index only names subtests),
+    # so the items that matter are the new ones the baseline did not have;
+    # items removed or moved change nothing.
+    def key(it):
+        meta, sql, expected = it
+        return (tuple(sorted(meta.items())), sql, expected)
+
+    seen = {}
+    for it in old_items:
+        seen[key(it)] = seen.get(key(it), 0) + 1
+    changed = []
+    for i, it in enumerate(new_items):
+        k = key(it)
+        if seen.get(k):
+            seen[k] -= 1
+        else:
+            changed.append(i)
+    if not new_items:
+        return None
+    pos = {t: i for i, t in enumerate(idx.tests)}
+    readers = idx.opens_of(rel)
+    acc = 0
+    # every partial test over this fixture: its changed items
+    for tid, (_, _, fx, n) in PARTS.items():
+        if fx != fixture or tid not in parts:
+            continue
+        p = parts[tid]
+        if not changed:
+            continue
+        acc |= 1 << p["real"]
+        if max(changed) >= len(p["parts"]):
+            acc |= 1 << p["base"]  # more items than the traced ones: whole test
+        else:
+            for i in changed:
+                acc |= 1 << p["parts"][i]
+    for tid in ITEM_CONSUMERS[fixture]:
+        if changed and tid in pos:
+            acc |= 1 << pos[tid]
+    # other readers: tests of the item-loading classes only load the list
+    rest = readers & ~acc
+    for i in range(idx.n):
+        if rest >> i & 1:
+            t = idx.tests[i]
+            base = t.split("@", 1)[0]
+            if base.rsplit("::", 1)[0] in ITEM_LOADING_CLASSES or base in PARTS:
+                rest &= ~(1 << i)
+    an.item_fixture = True
+    an.notes.append(f"fixture items {rel}: {len(changed)} of {len(new_items)} new ({len(old_items)} before)")
+    return acc | rest
 
 
 def _config_breaks_pytest(rel: str, new_text) -> bool:
