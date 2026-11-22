@@ -63,6 +63,12 @@ STATE = os.environ.get("BR_STATE", os.path.join(MAPS, "state.pkl"))
 CPU_MAP = os.environ.get("BR_CPU_MAP", os.path.join(MAPS, "cpu.json"))
 MODULES = os.environ.get("BR_MODULES", os.path.join(MAPS, "modules.json"))
 IMPORT_ALL_MS = 300
+# Equivalence check of the TPC executor tests (selector/eqfp.py): fingerprint
+# the head outputs of every item instead of executing it (measured ~3.7 s for
+# the 99 TPC-DS items against ~27 s to replay the test).
+EQ_MAP = os.environ.get("BR_EQ_MAP", os.path.join(MAPS, "eq.json"))
+EQ_CPU_MS = int(os.environ.get("BR_EQ_CPU_MS", "4000"))
+NO_EQ = os.environ.get("BR_NO_EQ") == "1"
 
 
 # interpreter machinery that cannot be fingerprinted and never holds patched
@@ -181,6 +187,75 @@ def _cpu():
     return _CPU
 
 
+_EQB = None
+
+
+def eq_base() -> dict:
+    global _EQB
+    if _EQB is None:
+        try:
+            with open(EQ_MAP) as fh:
+                _EQB = json.load(fh)
+        except Exception as e:  # noqa
+            log("eq map unavailable:", e)
+            _EQB = {}
+    return _EQB
+
+
+def eq_of(bits: int, idx, num_of_id, overlay) -> set:
+    """Tests the change reaches only through their head phases (not T@tail):
+    a fingerprint check of the head outputs decides them."""
+    eq = getattr(idx, "eq", None)
+    if NO_EQ or not eq or any(r.startswith("tests/") for r in overlay):
+        return set()
+    base = eq_base()
+    out = set()
+    for tid, p in eq.items():
+        if bits >> p["real"] & 1 and not bits >> p["tail"] & 1 and tid in base:
+            n = num_of_id.get(tid)
+            if n is not None:
+                out.add(n)
+    return out
+
+
+# Items whose fingerprint changed run for real only while that costs (local
+# CPU, scaled) less than this share of the test's schedule time.
+EQ_RUN_RATIO = float(os.environ.get("BR_EQ_RUN_RATIO", "0.45"))
+
+
+def eq_costs(tests_by_num, dur) -> dict:
+    """test id -> (base ms, per-item ms, limit ms) in local CPU (cpu.json)."""
+    from .parts import pseudo_id
+
+    t = _cpu()["tests"]
+    out = {}
+    for n, x in tests_by_num.items():
+        tid = x["id"]
+        if tid not in eq_base():
+            continue
+        base = t.get(pseudo_id(tid, "base"))
+        items = [t.get(pseudo_id(tid, i), 0) for i in range(len(eq_base()[tid]))]
+        if base is None:
+            continue
+        setup = file_cpu_ms(x["file"]) + class_cpu_ms(tid.rsplit("::", 1)[0])
+        out[tid] = (base, items, max(0.0, EQ_RUN_RATIO * dur[n] - setup) / CPU_FACTOR)
+    return out
+
+
+def eq_cpu_ms(n, keep, tests_by_num) -> float:
+    items = len(eq_base().get(tests_by_num[n]["id"], ())) or 1
+    frac = 1.0 if keep is None else max(0.25, len(keep) / items)
+    return EQ_CPU_MS * frac * CPU_FACTOR
+
+
+def cand_cpu_ms(n, partial, eq, tests_by_num, dur) -> float:
+    if eq and n in eq:
+        return eq_cpu_ms(n, (partial or {}).get(n), tests_by_num)
+    if partial and n in partial:
+        return partial_cpu_ms(n, partial[n], tests_by_num, dur)
+    return test_cpu_ms(n, tests_by_num, dur)
+
+
 def test_cpu_ms(n, tests_by_num, dur) -> float:
     """Replay CPU of one test: measured on the pinned checkout in this
     harness (maps/cpu.json) scaled to the scoring machine, else the
@@ -214,13 +289,11 @@ def partial_of(bits: int, idx, num_of_id) -> dict:
     return out
 
 
-def worth_after_fail(n, partial, tests_by_num, dur) -> bool:
+def worth_after_fail(n, partial, tests_by_num, dur, eq=None) -> bool:
     """Once a commit has a failing test it needs a worker anyway: including a
     candidate blind then costs at most its duration, so only replays far
     cheaper than that remain worth their CPU."""
-    c = (partial_cpu_ms(n, partial[n], tests_by_num, dur) if partial and n in partial
-         else test_cpu_ms(n, tests_by_num, dur))
-    return c < AFTER_FAIL_RATIO * dur[n]
+    return cand_cpu_ms(n, partial, eq, tests_by_num, dur) < AFTER_FAIL_RATIO * dur[n]
 
 
 def whole_items(bits: int, idx) -> int:
@@ -245,7 +318,7 @@ def partial_cpu_ms(n, keep, tests_by_num, dur) -> float:
     return (base + sum(max(0, x - base) for x in items)) * CPU_FACTOR + 2
 
 
-def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS, partial=None) -> int:
+def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS, partial=None, eq=None) -> int:
     files = set()
     classes = set()
     total = base_ms
@@ -253,8 +326,7 @@ def replay_cpu_ms(nums, tests_by_num, dur, base_ms: int = CHILD_BASE_MS, partial
         t = tests_by_num[n]
         files.add(t["file"])
         classes.add(t["id"].rsplit("::", 1)[0])
-        total += (partial_cpu_ms(n, partial[n], tests_by_num, dur) if partial and n in partial
-                  else test_cpu_ms(n, tests_by_num, dur))
+        total += cand_cpu_ms(n, partial, eq, tests_by_num, dur)
     for f in files:
         total += file_cpu_ms(f)
     for c in classes:
@@ -274,7 +346,7 @@ def lb_cost(total: int, longest: int, count: int) -> int:
     return min(max(longest, -(-total // k)) + 2000 * k for k in range(1, min(8, count) + 1))
 
 
-def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHILD_BASE_MS, partial=None):
+def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHILD_BASE_MS, partial=None, eq=None):
     """Split candidates into (replay, blind). Replay the cheapest prefix of the
     candidates (by duration) maximising (cost of selecting everything) -
     (cost of the rest) - (replay CPU). Uses the packing lower bound while
@@ -285,8 +357,7 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHIL
     # cheapest replay per second of schedule first (a test whose replay costs
     # far less CPU than its recorded duration comes early, however long)
     partial = partial or {}
-    tcpu = {n: (partial_cpu_ms(n, partial[n], tests_by_num, dur) if n in partial
-                else test_cpu_ms(n, tests_by_num, dur)) for n in set(cand) - forced_set}
+    tcpu = {n: cand_cpu_ms(n, partial, eq, tests_by_num, dur) for n in set(cand) - forced_set}
     order = sorted(tcpu, key=lambda n: ((tcpu[n] + 20) / (dur[n] + 20), dur[n], n))
     if not order:
         return [], allsel, base_cost, 0
@@ -319,7 +390,7 @@ def plan_replay(cand: list, forced: list, dur, tests_by_num, base_ms: int = CHIL
         return [], allsel, base_cost, 0
     rep = order[:best_i]
     blind = sorted(forced_set | set(order[best_i:]))
-    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur, base_ms, partial)
+    net = P_PASS * (base_cost - sched_cost(blind, dur)) - replay_cpu_ms(rep, tests_by_num, dur, base_ms, partial, eq)
     if net <= 0:
         return [], allsel, base_cost, 0
     # tests that fit into the blind schedule's slack are free: no replay needed
@@ -338,28 +409,47 @@ def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_
     rest, forced = pl["sd"]["rest"], pl["forced"]
     static_keyed = set(to_nums(pl["an"].keyed)) | set(pl["sd"]["unknown"])
 
-    def job(nums, partial=None):
+    def job(nums, partial=None, eq=None):
         partial = partial or {}
+        eq = eq or set()
         return [(tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n], partial.get(n),
-                 worth_after_fail(n, partial, tests_by_num, dur))
+                 worth_after_fail(n, partial, tests_by_num, dur, eq), n in eq)
                 for n in sorted(nums, key=lambda n: (dur[n], n))]
 
     def plan(res):
         bits, note = km.readers(res, changed_mods, idx)
         if bits is None:
-            return (job(pl["replay"], pl.get("partial")), list(pl["replay"]), list(pl["blind"]),
+            return (job(pl["replay"], pl.get("partial"), pl.get("eq")), list(pl["replay"]), list(pl["blind"]),
                     "fallback: " + note)
         kbits, ibits = bits
         # both the diff's readers and the static keyed candidates are supersets
         narrowed = (set(km_nums(kbits)) | set(to_nums(ibits))) & static_keyed
         cand = (rest | narrowed) - forced
-        partial = partial_of(pl["an"].other | ((kbits | ibits) & whole_items(pl["an"].keyed, idx)), idx, num_of_id)
+        reach = pl["an"].other | ((kbits | ibits) & whole_items(pl["an"].keyed, idx))
+        partial = partial_of(reach, idx, num_of_id)
+        eq = eq_of(reach, idx, num_of_id, pl["an"].overlay) & cand
         # the child already paid for its start and sqlglot import
         rep, blind, _, _ = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num, base_ms=0,
-                                       partial=partial)
-        return job(rep, partial), list(rep), list(blind), f"{note} -> {len(cand)} cand"
+                                       partial=partial, eq=eq)
+        return job(rep, partial, eq & set(rep)), list(rep), list(blind), f"{note} -> {len(cand)} cand"
 
     return plan
+
+
+PROBE = os.environ.get("BR_PROBE", "")
+
+
+def _probe_hit(kind, sel, tests_by_num, dur) -> bool:
+    big = len(sel) >= 1000
+    tpcds = any(tests_by_num[n]["id"].endswith("::test_execute_tpcds") for n in sel)
+    c = cost_ms(optimize(sel, dur, swap_trials=64), dur)
+    if kind == "all":
+        return big
+    if kind == "tpcds":
+        return tpcds and not big
+    if kind == "mid":
+        return not big and not tpcds and c >= 5000
+    return False
 
 
 def write_out(out_fd: int, lines: list):
@@ -459,6 +549,7 @@ def main():
         if not a.replayable or NO_REPLAY:
             forced |= cand
             cand = set()
+        eq = set()
         if LABEL_OUT and a.replayable:
             # local labelling mode: replay every candidate, keep nothing blind
             cand |= forced
@@ -467,18 +558,20 @@ def main():
         else:
             partial = partial_of(a.cand, idx, num_of_id) if cand else {}
             partial = {n: k for n, k in partial.items() if n in cand}
+            eq = eq_of(a.cand, idx, num_of_id, a.overlay) & cand if cand else set()
             rep, blind, base_cost, net = plan_replay(sorted(cand), sorted(forced), dur, tests_by_num,
-                                                     partial=partial)
+                                                     partial=partial, eq=eq)
         plans[cid] = {"replay": rep, "blind": blind, "an": a, "base": base_cost, "net": net,
                       "ncand": len(cand), "nforced": len(forced), "cand": cand, "forced": forced,
-                      "partial": {n: k for n, k in partial.items() if n in rep} if not LABEL_OUT else {}}
+                      "partial": {n: k for n, k in partial.items() if n in rep} if not LABEL_OUT else {},
+                      "eq": (eq & set(rep)) if not LABEL_OUT else set()}
         if a.keyed and a.replayable and a.code_changed and not NO_SD and not LABEL_OUT:
             # what the keyed part costs at most: the plan without it
             rest = (set(to_nums(a.other)) | (set(unknown) if a.other else set())) - forced
             r_rep, r_blind, _, r_net = plan_replay(sorted(rest), sorted(forced), dur, tests_by_num)
             # expected cost of the static plan if its replays pass, against the
             # best case of the diff (keyed candidates all dropped) plus its CPU
-            static = sched_cost(blind, dur) + (replay_cpu_ms(rep, tests_by_num, dur, partial=partial) if rep else 0)
+            static = sched_cost(blind, dur) + (replay_cpu_ms(rep, tests_by_num, dur, partial=partial, eq=eq) if rep else 0)
             narrow = sched_cost(r_blind, dur) + replay_cpu_ms(r_rep, tests_by_num, dur) + SD_CPU_MS
             gain = static - narrow
             if gain > SD_MIN_GAIN_MS:
@@ -559,7 +652,7 @@ def main():
                 cid = queue.pop(0)
                 pl = plans[cid]
                 now = time.monotonic()
-                est = replay_cpu_ms(pl["replay"], tests_by_num, dur, partial=pl.get("partial")) / 1000.0
+                est = replay_cpu_ms(pl["replay"], tests_by_num, dur, partial=pl.get("partial"), eq=pl.get("eq")) / 1000.0
                 if "sd" in pl:
                     est += SD_CPU_MS / 1000.0
                 elif pl["an"].needs_probe:
@@ -572,9 +665,12 @@ def main():
                 # cheapest first, so a breaking change is usually caught early
                 job_tests = [
                     (tests_by_num[n]["id"], max(10.0, dur[n] / 1000.0 * 12 + 5), dur[n],
-                     pl.get("partial", {}).get(n), worth_after_fail(n, pl.get("partial"), tests_by_num, dur))
+                     pl.get("partial", {}).get(n), worth_after_fail(n, pl.get("partial"), tests_by_num, dur, pl.get("eq")),
+                     n in pl.get("eq", ()))
                     for n in sorted(pl["replay"], key=lambda n: (dur[n], n))
                 ]
+                if pl.get("eq"):
+                    log(f"{cid}: equivalence check " + ", ".join(tests_by_num[n]["id"].rsplit("::", 1)[1] for n in pl["eq"]))
                 if pl.get("partial"):
                     log(f"{cid}: partial replay "
                         + ", ".join(f"{tests_by_num[n]['id'].rsplit('::', 1)[1]}[{len(k)}]"
@@ -585,7 +681,9 @@ def main():
                              stop_after_fail_ms=0 if LABEL_OUT else STOP_AFTER_FAIL_MS,
                              sd=({"mods": km.mods, "state": km.state, "plan": pl["sd"]["plan"]}
                                  if "sd" in pl else None),
-                             import_all=base_mods if a.needs_probe else None)
+                             import_all=base_mods if a.needs_probe else None,
+                             eq_base={tid: v for tid, v in eq_base().items()} if (pl.get("eq") or "sd" in pl) else None,
+                             eq_cost=eq_costs(tests_by_num, dur) if (pl.get("eq") or "sd" in pl) else None)
                 except Exception as e:  # noqa
                     log(f"{cid}: replay start failed {e}")
                     results[cid] = {"error": str(e)}
@@ -639,6 +737,8 @@ def main():
                     sel |= set(rep) - ran
                     log(f"{cid}: replayed {len(rep)} in {r.get('cpu')}s cpu -> {len(failed)} failing {r.get('t')}")
         r = results.get(cid)
+        if r is not None and r.get("eq"):
+            log(f"{cid}: eq {r['eq']}")
         if r is not None and "cpu" in r:
             log(f"{cid}: CPU child={r.get('cpu')} pre={r.get('pre_cpu')} "
                 f"imports={round(sum(r.get('mcpu', {}).values()), 3)} sd={'sd' in r}")
@@ -650,6 +750,11 @@ def main():
             # are not fully mapped: any test can fail (see analyze.fail_bits)
             sel |= set(to_nums(idx.ALL))
         sel = sorted(sel)
+        if PROBE and sel and _probe_hit(PROBE, sel, tests_by_num, dur):
+            # diagnostic build only: drop this category's selection so the
+            # board's totals measure what the category costs and misses
+            log(f"{cid}: probe {PROBE} drops {len(sel)} tests")
+            sel = []
         if LABEL_OUT:
             labels[cid] = {"failing": sel, "kind": "replay" if rep else "blind"}
         workers = optimize(sel, dur, swap_trials=256) if sel else []

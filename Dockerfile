@@ -25,6 +25,10 @@ RUN cd /app && python -m selector.verify /opt/sqlglot
 RUN cd /app && python -m selector.statebuild /opt/sqlglot /app/maps/state.pkl \
     && chmod a+r /app/maps/state.pkl /app/maps/modules.json
 
+# Baseline fingerprints of the TPC executor tests' head outputs (selector/eqfp.py).
+RUN cd /app && SKIP_INTEGRATION=0 python -m selector.eqfp /opt/sqlglot /app/maps/eq.json \
+    && chmod a+r /app/maps/eq.json
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     BR_REPO=/opt/sqlglot \

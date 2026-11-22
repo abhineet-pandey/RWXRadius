@@ -223,6 +223,38 @@ def _child(job: dict, wfd: int):
             job["tests"] = tests
             out["sd"] = {"rep": rep, "blind": blind, "note": note}
 
+        failed = set()
+        passed = set()
+        # equivalence check (selector/eqfp.py): items whose head outputs are as
+        # at the baseline pass; only the others run for real
+        eq_pass, eq_keep = set(), {}
+        for item in job["tests"]:
+            if len(item) > 5 and item[5] and job.get("eq_base") and item[0] in job["eq_base"]:
+                nid = item[0]
+                te = time.process_time()
+                try:
+                    from . import eqfp
+
+                    signal.setitimer(signal.ITIMER_REAL, 120)
+                    d = eqfp.differing(nid, job["eq_base"][nid], None if item[3] is None else set(item[3]),
+                                       (job.get("eq_cost") or {}).get(nid))
+                except BaseException:  # noqa
+                    d = None
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                out.setdefault("eq", {})[nid] = {"diff": d if d is None or d == "over" else len(d),
+                                                  "cpu": round(time.process_time() - te, 3)}
+                if d is None:
+                    continue
+                if d == "over":
+                    # running the changed items costs more than keeping the
+                    # test: it stays selected unrun
+                    failed.add(nid)
+                    continue
+                if not d:
+                    eq_pass.add(nid)
+                    continue
+                eq_keep[nid] = d
         out["pre_cpu"] = round(time.process_time() - t0, 3)
         # group: file -> class -> [(nodeid, method, timeout)]
         groups: dict = {}
@@ -232,15 +264,19 @@ def _child(job: dict, wfd: int):
         worth = set()
         for item in job["tests"]:
             nid, timeout = item[0], item[1]
+            if nid in failed:
+                continue
+            if nid in eq_pass:
+                passed.add(nid)
+                continue
             if len(item) > 3 and item[3] is not None:
                 keep_of[nid] = item[3]
+            if nid in eq_keep:
+                keep_of[nid] = eq_keep[nid]
             if len(item) > 4 and item[4]:
                 worth.add(nid)
             f, c, m = nid.split("::")
             groups.setdefault(f, {}).setdefault(c, []).append((nid, m, timeout))
-
-        failed = set()
-        passed = set()
 
         class Result(unittest.TestResult):
             def __init__(self, timeouts):
@@ -411,12 +447,14 @@ class Replayer:
                     log("preload failed", m, e)
 
     def start(self, key: str, overlay: dict, probe: list, tests: list, deadline: float, stop_after_fail_ms: int = 0,
-              sd: dict | None = None, import_all: list | None = None):
+              sd: dict | None = None, import_all: list | None = None, eq_base: dict | None = None,
+              eq_cost: dict | None = None):
         dest = os.path.join(TMP, key)
         shutil.rmtree(dest, ignore_errors=True)
         build_overlay(self.repo, overlay, dest)
         job = {"overlay": dest, "probe": probe, "tests": tests, "stop_after_fail_ms": stop_after_fail_ms,
-               "sd": sd, "import_all": import_all, "measure": bool(os.environ.get("BR_MEASURE"))}
+               "sd": sd, "import_all": import_all, "measure": bool(os.environ.get("BR_MEASURE")),
+               "eq_base": eq_base, "eq_cost": eq_cost}
         if _uses_duckdb(dest, {str(t[0]).split("::")[0] for t in tests}):
             # duckdb reserves several GB of address space when it connects: an
             # address-space cap kills the child (measured: 3 GB dies, 4 GB ok),
