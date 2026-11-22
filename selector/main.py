@@ -56,7 +56,7 @@ FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0,
 # and fingerprinting it costs about this much CPU on top of a replay child.
 SD_CPU_MS = int(os.environ.get("BR_SD_CPU_MS", "700"))
 NO_SD = os.environ.get("BR_NO_SD") == "1"
-SD_MIN_GAIN_MS = int(os.environ.get("BR_SD_MIN_GAIN_MS", "600"))
+SD_MIN_GAIN_MS = int(os.environ.get("BR_SD_MIN_GAIN_MS", "3000"))
 MAPS = os.path.dirname(INDEX)
 KEYS = os.environ.get("BR_KEYS", os.path.join(MAPS, "keys.pkl.gz"))
 STATE = os.environ.get("BR_STATE", os.path.join(MAPS, "state.pkl"))
