@@ -69,3 +69,34 @@ def restrict(tc, test_id: str, keep) -> None:
                 setattr(mod, name, loader)
 
     setattr(tc, meth_name, run)
+
+
+# Tests that iterate a fixture's items without being partial tests (cheap to
+# replay whole) and classes whose fixtures load the items into lists without
+# using them: for an edit that keeps the item count and parses, only the
+# changed items matter to the partial tests, these tests replay whole, and the
+# other tests of these classes are unaffected (their setUpClass loads the
+# same number of items from the same code).
+ITEM_CONSUMERS = {
+    "optimizer/tpc-h/tpc-h.sql": ["tests/test_executor.py::TestExecutor::test_execute_tpch"],
+    "optimizer/tpc-ds/tpc-ds.sql": [],
+}
+ITEM_LOADING_CLASSES = ("tests/test_executor.py::TestExecutor",)
+
+
+def fixture_items(repo_root: str, text: str):
+    """The items tests/helpers.py's load_sql_fixture_pairs yields for this
+    text, with the pinned checkout's own helpers."""
+    import importlib.util
+    import os
+
+    spec = importlib.util.spec_from_file_location("_br_helpers", os.path.join(repo_root, "tests", "helpers.py"))
+    h = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(h)
+    statements = h._filter_comments(text).split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql, meta = h._extract_meta(statements[i].strip())
+            out.append((meta, sql, statements[i + 1].strip()))
+    return out
