@@ -49,7 +49,7 @@ STOP_AFTER_FAIL_MS = int(os.environ.get("BR_STOP_AFTER_FAIL_MS", str(10 ** 9)))
 # the CPU is spent and a worker is needed anyway. Prior probability that the
 # replayed candidates of a commit all pass (half the sample's code commits with
 # candidates break something).
-P_PASS = float(os.environ.get("BR_P_PASS", "0.5"))
+P_PASS = float(os.environ.get("BR_P_PASS", "0.65"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL_RATIO", "0.4"))
 FILE_CPU_RATIO = {"tests/test_optimizer.py": 2.0, "tests/test_executor.py": 2.0, "tests/test_generator.py": 0.85}
 # State diff (see statefp): importing every sqlglot module from the overlay
