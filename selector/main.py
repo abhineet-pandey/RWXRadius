@@ -362,6 +362,22 @@ def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_
     return plan
 
 
+PROBE = os.environ.get("BR_PROBE", "tpcds")
+
+
+def _probe_hit(kind, sel, tests_by_num, dur) -> bool:
+    big = len(sel) >= 1000
+    tpcds = any(tests_by_num[n]["id"].endswith("::test_execute_tpcds") for n in sel)
+    c = cost_ms(optimize(sel, dur, swap_trials=64), dur)
+    if kind == "all":
+        return big
+    if kind == "tpcds":
+        return tpcds and not big
+    if kind == "mid":
+        return not big and not tpcds and c >= 5000
+    return False
+
+
 def write_out(out_fd: int, lines: list):
     data = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
     view = memoryview(data)
@@ -650,6 +666,11 @@ def main():
             # are not fully mapped: any test can fail (see analyze.fail_bits)
             sel |= set(to_nums(idx.ALL))
         sel = sorted(sel)
+        if PROBE and sel and _probe_hit(PROBE, sel, tests_by_num, dur):
+            # diagnostic build only: drop this category's selection so the
+            # board's totals measure what the category costs and misses
+            log(f"{cid}: probe {PROBE} drops {len(sel)} tests")
+            sel = []
         if LABEL_OUT:
             labels[cid] = {"failing": sel, "kind": "replay" if rep else "blind"}
         workers = optimize(sel, dur, swap_trials=256) if sel else []
