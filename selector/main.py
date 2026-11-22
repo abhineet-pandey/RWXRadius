@@ -362,7 +362,7 @@ def make_sd_plan(cid, pl, km, changed_mods, to_nums, dur, tests_by_num, idx, km_
     return plan
 
 
-PROBE = os.environ.get("BR_PROBE", "all")
+PROBE = os.environ.get("BR_PROBE", "tpcds_only")
 
 
 def _probe_hit(kind, sel, tests_by_num, dur) -> bool:
@@ -666,6 +666,13 @@ def main():
             # are not fully mapped: any test can fail (see analyze.fail_bits)
             sel |= set(to_nums(idx.ALL))
         sel = sorted(sel)
+        if PROBE == "tpcds_only" and len(sel) < 1000:
+            # diagnostic build only: drop just test_execute_tpcds, keep the
+            # rest, so misses count the commits where that test itself fails
+            kept = [n for n in sel if not tests_by_num[n]["id"].endswith("::test_execute_tpcds")]
+            if len(kept) < len(sel):
+                log(f"{cid}: probe tpcds_only drops test_execute_tpcds")
+            sel = kept
         if PROBE and sel and _probe_hit(PROBE, sel, tests_by_num, dur):
             # diagnostic build only: drop this category's selection so the
             # board's totals measure what the category costs and misses
